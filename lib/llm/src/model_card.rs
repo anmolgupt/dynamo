@@ -254,6 +254,14 @@ pub struct ModelDeploymentCard {
     #[serde(default)]
     pub media_fetcher: Option<MediaFetcher>,
 
+    /// Sentence-transformer prompt prefixes, loaded from `config_sentence_transformers.json`.
+    /// Keys are prompt names (e.g. `"query"`, `"document"`), values are the prefix strings
+    /// to prepend (e.g. `"query: "`, `"passage: "`). Present only for sentence-transformer
+    /// style embedding models that ship this config file.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sentence_transformer_prompts: Option<std::collections::HashMap<String, String>>,
+
     #[serde(skip, default)]
     checksum: OnceLock<String>,
 }
@@ -714,6 +722,9 @@ impl ModelDeploymentCard {
         // This gets replaced when we `set_name`
         let display_name = local_path.display().to_string();
 
+        let sentence_transformer_prompts =
+            load_sentence_transformer_prompts(local_path);
+
         Ok(Self {
             slug: Slug::from_string(&display_name),
             display_name,
@@ -734,9 +745,27 @@ impl ModelDeploymentCard {
             runtime_config: ModelRuntimeConfig::default(),
             media_decoder: None,
             media_fetcher: None,
+            sentence_transformer_prompts,
             checksum: OnceLock::new(),
         })
     }
+}
+
+/// Try to load the `prompts` map from `config_sentence_transformers.json` in `dir`.
+/// Returns `None` if the file is absent or malformed — this is expected for non-sentence-transformer models.
+fn load_sentence_transformer_prompts(
+    dir: &Path,
+) -> Option<std::collections::HashMap<String, String>> {
+    let path = dir.join("config_sentence_transformers.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let prompts = v.get("prompts")?.as_object()?;
+    Some(
+        prompts
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+            .collect(),
+    )
 }
 
 impl PartialEq for ModelDeploymentCard {

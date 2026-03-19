@@ -102,6 +102,32 @@ class VllmHealthCheckPayload(HealthCheckPayload):
         super().__init__()
 
 
+class VllmEmbeddingHealthCheckPayload(HealthCheckPayload):
+    """Health check payload for vLLM embedding workers.
+
+    Sends a PreprocessedEmbeddingRequest with a single BOS token.
+    """
+
+    def __init__(self, engine_client=None):
+        """
+        Initialize vLLM embedding health check payload.
+
+        Args:
+            engine_client: Optional vLLM AsyncLLM engine client to extract BOS token from.
+                          If provided, will attempt to use the model's actual BOS token.
+        """
+        bos_token_id = _get_bos_token_id_from_engine(engine_client)
+        self.default_payload = {
+            "token_ids": [[bos_token_id]],
+            "model": "",
+            "encoding_format": None,
+            "dimensions": None,
+            "mdc_sum": None,
+            "annotations": [],
+        }
+        super().__init__()
+
+
 class VllmPrefillHealthCheckPayload(HealthCheckPayload):
     """
     vLLM-specific health check payload for prefill workers in disaggregated mode.

@@ -663,7 +663,14 @@ impl ModelWatcher {
                 ManyOut<Annotated<NvCreateEmbeddingResponse>>,
             >::new();
 
-            let preprocessor = OpenAIPreprocessor::new(card.clone())?.into_operator();
+            // Embedding models don't have a chat_template, so use a no-op formatter
+            let tokenizer = card.tokenizer().context("tokenizer")?;
+            let formatter = PromptFormatter::no_op();
+            let PromptFormatter::OAI(formatter) = formatter;
+            let preprocessor =
+                OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer)
+                    .context("OpenAIPreprocessor::new_with_parts")?
+                    .into_operator();
             let backend = Backend::from_mdc(card).into_operator();
 
             let router = PushRouter::<

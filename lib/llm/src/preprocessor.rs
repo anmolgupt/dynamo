@@ -150,6 +150,9 @@ pub struct OpenAIPreprocessor {
     media_loader: Option<MediaLoader>,
     /// Max context length (in tokens) this model can handle, from ModelDeploymentCard
     context_length: u32,
+    /// Sentence-transformer prompt prefixes (from `config_sentence_transformers.json`).
+    /// Used to prepend task-specific text when `input_type` is set on an embedding request.
+    sentence_transformer_prompts: Option<HashMap<String, String>>,
 }
 
 impl OpenAIPreprocessor {
@@ -190,6 +193,7 @@ impl OpenAIPreprocessor {
         };
 
         let context_length = mdc.context_length;
+        let sentence_transformer_prompts = mdc.sentence_transformer_prompts.clone();
 
         Ok(Arc::new(Self {
             formatter,
@@ -201,6 +205,7 @@ impl OpenAIPreprocessor {
             tool_call_parser,
             media_loader,
             context_length,
+            sentence_transformer_prompts,
         }))
     }
     /// Encode a string to it's tokens
@@ -615,13 +620,67 @@ impl OpenAIPreprocessor {
         let mut annotations = HashMap::new();
         let mut builder = PreprocessedEmbeddingRequest::builder();
 
+        // Resolve the text prefix for the requested input_type.
+        // Looks up the key in the model's sentence-transformer prompts config.
+        // "passage" is accepted as an alias for "document" for NIM API compatibility
+        // (the config ships key "document" with value "passage: ").
+        let prefix: &str = match request.input_type.as_deref() {
+            None => "",
+            Some(input_type) => {
+                match self.sentence_transformer_prompts.as_ref() {
+                    None => {
+                        tracing::warn!(
+                            input_type,
+                            "input_type specified but model has no sentence-transformer prompts config; ignoring"
+                        );
+                        ""
+                    }
+                    Some(prompts) => {
+                        prompts
+                            .get(input_type)
+                            .or_else(|| {
+                                // NIM compatibility: "passage" maps to the "document" key
+                                if input_type == "passage" {
+                                    prompts.get("document")
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(|s| s.as_str())
+                            .unwrap_or_else(|| {
+                                tracing::warn!(
+                                    input_type,
+                                    available = ?prompts.keys().collect::<Vec<_>>(),
+                                    "unknown input_type; ignoring"
+                                );
+                                ""
+                            })
+                    }
+                }
+            }
+        };
+
         let all_token_ids = match &request.inner.input {
             dynamo_async_openai::types::EmbeddingInput::String(s) => {
-                let encoding = self.tokenizer.encode(s)?;
+                let text = if prefix.is_empty() {
+                    s.clone()
+                } else {
+                    format!("{prefix}{s}")
+                };
+                let encoding = self.tokenizer.encode(&text)?;
                 vec![encoding.token_ids().to_vec()]
             }
             dynamo_async_openai::types::EmbeddingInput::StringArray(arr) => {
-                let input_strs: Vec<String> = arr.to_vec();
+                let input_strs: Vec<String> = arr
+                    .iter()
+                    .map(|s| {
+                        if prefix.is_empty() {
+                            s.clone()
+                        } else {
+                            format!("{prefix}{s}")
+                        }
+                    })
+                    .collect();
                 let encodings = tokio::task::spawn_blocking({
                     let tokenizer = self.tokenizer.clone();
                     let strs = input_strs.clone();

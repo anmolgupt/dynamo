@@ -174,6 +174,16 @@ async def worker() -> None:
             snapshot_engine=snapshot_engine,
         )
         logger.debug("multimodal worker completed")
+    elif config.embedding_worker:
+        from .init_embedding import init_embedding
+
+        await init_embedding(
+            runtime,
+            config,
+            shutdown_event,
+            snapshot_engine=snapshot_engine,
+        )
+        logger.debug("init_embedding completed")
     elif config.disaggregation_mode == DisaggregationMode.PREFILL:
         await init_prefill(
             runtime,

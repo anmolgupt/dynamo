@@ -19,6 +19,15 @@ pub struct NvCreateEmbeddingRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nvext: Option<NvExt>,
+
+    /// Semantic role of the input text for asymmetric retrieval models.
+    /// When set, a task-specific prefix is prepended to each input before tokenization,
+    /// using the model's `config_sentence_transformers.json` prompts mapping.
+    ///
+    /// Common values: `"query"` for search queries, `"passage"` or `"document"` for
+    /// indexed texts. Matches NIM's `input_type` parameter behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<String>,
 }
 
 /// A response structure for unary chat completion responses, embedding OpenAI's

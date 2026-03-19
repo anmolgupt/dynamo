@@ -104,6 +104,13 @@ class DynamoVllmArgGroup(ArgGroup):
         )
         add_negatable_bool_argument(
             g,
+            flag_name="--embedding-worker",
+            env_var="DYN_VLLM_EMBEDDING_WORKER",
+            default=False,
+            help="Run as a text embedding worker. Uses vLLM's encode() API for pooling models.",
+        )
+        add_negatable_bool_argument(
+            g,
             flag_name="--enable-multimodal",
             env_var="DYN_VLLM_ENABLE_MULTIMODAL",
             default=False,
@@ -191,6 +198,9 @@ class DynamoVllmConfig(ConfigBase):
     embedding_transfer_mode: Union[
         str, EmbeddingTransferMode
     ]  # resolved to enum in validate()
+
+    # Text embedding worker
+    embedding_worker: bool
 
     # Headless mode for multi-node TP/PP
     headless: bool = False

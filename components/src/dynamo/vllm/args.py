@@ -158,6 +158,9 @@ def update_dynamo_config_with_engine(
     ):
         dynamo_config.component = "backend"
         dynamo_config.endpoint = "generate"
+    elif dynamo_config.embedding_worker:
+        dynamo_config.component = "embedding"
+        dynamo_config.endpoint = "generate"
     elif dynamo_config.disaggregation_mode == DisaggregationMode.PREFILL:
         dynamo_config.component = "prefill"
         dynamo_config.endpoint = "generate"
@@ -187,12 +190,14 @@ def update_dynamo_config_with_engine(
     _reject_connector_flag(dynamo_config)
 
     # If disaggregation mode is prefill, require explicit --kv-transfer-config
+    # (embedding workers skip this check as they don't use disaggregation)
     has_kv_transfer_config = (
         hasattr(engine_config, "kv_transfer_config")
         and engine_config.kv_transfer_config is not None
     )
     if (
         dynamo_config.disaggregation_mode == DisaggregationMode.PREFILL
+        and not dynamo_config.embedding_worker
         and not has_kv_transfer_config
     ):
         raise ValueError(
@@ -219,7 +224,10 @@ def update_engine_config_with_dynamo(
     dynamo_config: Config, engine_config: AsyncEngineArgs
 ) -> None:
     """Update engine config based on Dynamo config."""
-    if engine_config.enable_prefix_caching is None:
+    if dynamo_config.embedding_worker:
+        engine_config.enable_prefix_caching = False
+        logger.info("Embedding worker: disabling prefix caching (not supported for pooling models)")
+    elif engine_config.enable_prefix_caching is None:
         logger.debug(
             "--enable-prefix-caching or --no-enable-prefix-caching not specified. "
             "Defaulting to True (vLLM v1 default behavior)"
@@ -246,6 +254,10 @@ def update_engine_config_with_dynamo(
         "enable_log_requests": False,
         "disable_log_stats": False,
     }
+
+    if dynamo_config.embedding_worker:
+        defaults["runner"] = "pooling"
+        logger.info("Embedding worker mode: setting runner=pooling")
 
     kv_cfg = create_kv_events_config(dynamo_config, engine_config)
     defaults["kv_events_config"] = kv_cfg
@@ -289,6 +301,13 @@ def create_kv_events_config(
     dynamo_config: Config, engine_config: AsyncEngineArgs
 ) -> Optional[KVEventsConfig]:
     """Create KVEventsConfig for prefix caching if needed."""
+    if dynamo_config.embedding_worker:
+        logger.info(
+            "Embedding worker detected: kv_events_config disabled "
+            "(embedding models don't use KV cache events)"
+        )
+        return None
+
     if dynamo_config.disaggregation_mode == DisaggregationMode.DECODE:
         logger.info(
             "Decode worker detected (disaggregation_mode=decode): "
