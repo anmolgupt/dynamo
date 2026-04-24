@@ -97,7 +97,11 @@ class DynamoRuntimeArgGroup(ArgGroup):
             env_var="DYN_REQUEST_PLANE",
             default="tcp",
             help="Determines how requests are distributed from routers to workers. "
-            "'tcp' is fastest for multi-process. 'local' bypasses the network for single-process deployments.",
+            "'tcp' uses TCP for all dispatch (default). 'local' is a hybrid mode: "
+            "co-located endpoints are served in-process while remote endpoints "
+            "are still reached via TCP — useful when a frontend co-locates a "
+            "small worker (e.g. embedding) but also needs to dispatch to a "
+            "remote worker (e.g. LLM on a separate GPU/process).",
             choices=["tcp", "nats", "http", "local"],
         )
         add_argument(

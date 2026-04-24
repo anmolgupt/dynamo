@@ -617,7 +617,11 @@ impl DistributedConfig {
 /// - `Nats`: Use NATS for request distribution (legacy)
 /// - `Http`: Use HTTP/2 for request distribution
 /// - `Tcp`: Use raw TCP for request distribution with msgpack support (default)
-/// - `Local`: No network transport; use in-process `LocalEndpointRegistry` only
+/// - `Local`: Local-first hybrid mode. Endpoints registered in this
+///   process are served via the in-process `LocalEndpointRegistry` (no
+///   TCP), while endpoints discovered in other processes are reached
+///   via a TCP client.  This process does not bind a request-plane
+///   TCP server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RequestPlaneMode {
     /// Use NATS for request plane
@@ -627,7 +631,14 @@ pub enum RequestPlaneMode {
     /// Use raw TCP for request plane with msgpack support
     #[default]
     Tcp,
-    /// In-process only — no network transport, dispatch via LocalEndpointRegistry
+    /// Local-first hybrid mode.
+    ///
+    /// Endpoints registered in this process are served via the in-process
+    /// `LocalEndpointRegistry` (zero network cost for the co-located
+    /// dispatch path).  Endpoints discovered in other processes are
+    /// reached via a real TCP client — so a frontend in `Local` mode can
+    /// still talk to remote workers over the network.  This process does
+    /// not bind a request-plane TCP server.
     Local,
 }
 

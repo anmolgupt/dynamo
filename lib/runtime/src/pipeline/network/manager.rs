@@ -264,7 +264,8 @@ impl NetworkManager {
             RequestPlaneMode::Local => {
                 tracing::info!(
                     %mode,
-                    "Initializing NetworkManager in local (in-process) mode — no network transport"
+                    "Initializing NetworkManager in local mode — local-first dispatch \
+                     for in-process endpoints, TCP fallback for remote endpoints"
                 );
             }
         }
@@ -320,9 +321,14 @@ impl NetworkManager {
             RequestPlaneMode::Http => self.create_http_client(),
             RequestPlaneMode::Tcp => self.create_tcp_client(),
             RequestPlaneMode::Nats => self.create_nats_client(),
-            RequestPlaneMode::Local => Err(anyhow::anyhow!(
-                "RequestPlaneMode::Local does not support network clients — use LocalEndpointRegistry for in-process dispatch"
-            )),
+            // Local mode prefers the in-process `LocalEndpointRegistry` for
+            // co-located endpoints (resolved earlier in the watcher), but
+            // also needs to be able to reach endpoints that live in other
+            // processes — for example a frontend co-located with a small
+            // embedding worker that still has to dispatch chat requests
+            // to a remote LLM worker over TCP.  Falling back to the TCP
+            // client here enables that "hybrid" topology.
+            RequestPlaneMode::Local => self.create_tcp_client(),
         }
     }
 
@@ -480,10 +486,20 @@ impl NetworkManager {
     }
 }
 
-/// No-op request plane server for `RequestPlaneMode::Local`.
+/// No-op request plane *server* for `RequestPlaneMode::Local`.
 ///
-/// Accepts endpoint registrations but does not open any network ports.
-/// In local mode, dispatch happens via `LocalEndpointRegistry` instead.
+/// In local mode, endpoints registered in this process are exposed via
+/// the in-process `LocalEndpointRegistry` and (when applicable) the
+/// typed embedding registry — they are not exposed to remote callers
+/// over TCP.  This server therefore accepts registrations as a no-op
+/// to keep the rest of the runtime happy without binding any listening
+/// sockets.
+///
+/// Note: this only suppresses the request-plane *server*.  Local mode
+/// still creates real TCP *clients* (so a co-located frontend can reach
+/// remote workers) and still uses the response-transport `tcp_server()`
+/// on `DistributedRuntime` for streaming responses back from those
+/// remote workers.
 struct NoOpServer;
 
 #[async_trait::async_trait]
