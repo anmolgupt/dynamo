@@ -22,3 +22,4 @@ pub use worker_monitor::{
 };
 
 pub(crate) mod local_engine_adapter;
+pub mod typed_embedding_registry;

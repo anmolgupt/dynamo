@@ -10,9 +10,20 @@ This avoids the TCP request-plane round-trip that the two-process
 while retaining the Dynamo preprocessing pipeline (Rust tokenizer,
 OpenAI-compatible API, etc.).
 
+Two in-process dispatch modes are supported, selected by the
+``DYN_EMBEDDING_DISPATCH`` environment variable:
+
+* ``json`` (default): generic ``serve_endpoint`` + ``LocalEngineAdapter``
+  in the Rust watcher.  Requests/responses round-trip through
+  ``serde_json::Value``.  Equivalent to the original implementation.
+* ``typed``: ``serve_embedding_endpoint`` + the direct-extraction
+  ``PythonEmbeddingEngine``.  Bypasses the ``serde_json::Value`` hop
+  and typically saves 15–25 ms per large-batch request.
+
 Usage:
     export DYN_DISCOVERY_BACKEND=mem
     export DYN_REQUEST_PLANE=local
+    export DYN_EMBEDDING_DISPATCH=typed   # or "json"
 
     python -m dynamo.vllm.local_embedding \
         --model nvidia/llama-nemotron-embed-1b-v2 \
@@ -122,13 +133,30 @@ async def async_main() -> None:
         (prometheus_names.labels.MODEL_NAME, config.served_model_name or config.model),
     ]
 
-    # serve_endpoint registers the handler in LocalEndpointRegistry AND with
-    # discovery, so the frontend watcher can find it.  Launch it as a
-    # background task so we can start the HTTP frontend in the same process.
-    # Note: serve_endpoint is a PyO3-bridged method that returns a Python
-    # Future (not a coroutine), so use ensure_future instead of create_task.
+    # Choose the dispatch registration method based on DYN_EMBEDDING_DISPATCH.
+    # Both variants also register the standard JSON engine with discovery so
+    # the frontend watcher can still find the endpoint; the "typed" variant
+    # additionally registers a direct-extraction typed engine that the
+    # embedding branch of the watcher will prefer over the JSON path.
+    dispatch_mode = os.environ.get("DYN_EMBEDDING_DISPATCH", "json").strip().lower()
+    if dispatch_mode == "typed":
+        serve_fn = generate_endpoint.serve_embedding_endpoint
+        logger.info(
+            "Local embedding server: using TYPED direct-extraction dispatch "
+            "(DYN_EMBEDDING_DISPATCH=typed)"
+        )
+    else:
+        serve_fn = generate_endpoint.serve_endpoint
+        logger.info(
+            "Local embedding server: using JSON dispatch "
+            "(DYN_EMBEDDING_DISPATCH=json)"
+        )
+
+    # Note: serve_endpoint / serve_embedding_endpoint are PyO3-bridged
+    # methods that return a Python Future (not a coroutine), so use
+    # ensure_future instead of create_task.
     worker_task = asyncio.ensure_future(
-        generate_endpoint.serve_endpoint(
+        serve_fn(
             handler.generate,
             graceful_shutdown=True,
             metrics_labels=model_metrics_labels,
@@ -156,7 +184,8 @@ async def async_main() -> None:
     logger.info(
         "Local embedding server ready — "
         f"model={config.model}, port={http_port}, "
-        f"request_plane=local, discovery=mem"
+        f"request_plane=local, discovery=mem, "
+        f"dispatch={dispatch_mode}"
     )
 
     try:

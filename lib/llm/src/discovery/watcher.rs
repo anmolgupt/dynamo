@@ -674,20 +674,33 @@ impl ModelWatcher {
             let backend = Backend::from_mdc(card).into_operator();
 
             // Lookup order for the service backend:
-            //   1. Generic JSON in-process engine via `LocalEngineAdapter`.
+            //   1. Typed in-process engine (fastest — no JSON round trip).
+            //      Populated by `Endpoint::serve_embedding_endpoint` from
+            //      the Python bindings.
+            //   2. Generic JSON in-process engine via `LocalEngineAdapter`.
             //      Populated by `Endpoint::serve_endpoint` (the default).
-            //   2. Network `PushRouter` — used when the worker lives in
+            //   3. Network `PushRouter` — used when the worker lives in
             //      another process.
             //
-            // The local lookup is keyed by the short endpoint name
+            // All local lookups are keyed by the short endpoint name
             // (e.g. `"generate"`) to match the convention used by the
-            // registrar in `EndpointConfigBuilder::register_local_engine`.
+            // registrars.
+            let typed_engine =
+                super::typed_embedding_registry::get(&mcid.endpoint);
             let local_engine = self
                 .drt
                 .local_endpoint_registry()
                 .get(&mcid.endpoint);
 
-            let service_backend = if let Some(engine) = local_engine {
+            let service_backend = if let Some(engine) = typed_engine {
+                tracing::info!(
+                    namespace = %mcid.namespace,
+                    component = %mcid.component,
+                    endpoint = %mcid.endpoint,
+                    "Using typed in-process dispatch for embedding endpoint (no JSON round trip)"
+                );
+                ServiceBackend::from_engine(engine)
+            } else if let Some(engine) = local_engine {
                 tracing::info!(
                     namespace = %mcid.namespace,
                     component = %mcid.component,
