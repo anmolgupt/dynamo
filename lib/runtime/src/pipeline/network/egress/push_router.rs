@@ -390,6 +390,14 @@ where
                     );
                     subject.clone()
                 }
+                TransportType::Local(name) => {
+                    tracing::debug!(
+                        instance_id = instance_id,
+                        endpoint = %name,
+                        "Using local (in-process) transport for instance"
+                    );
+                    name.clone()
+                }
             }
         };
 

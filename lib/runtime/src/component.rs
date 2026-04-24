@@ -73,6 +73,8 @@ pub enum TransportType {
     Nats(String),
     Http(String),
     Tcp(String),
+    /// In-process dispatch via LocalEndpointRegistry — no network address needed.
+    Local(String),
 }
 
 #[derive(Default)]

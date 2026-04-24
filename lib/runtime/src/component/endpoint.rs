@@ -51,6 +51,11 @@ impl EndpointConfigBuilder {
     }
 
     /// Register an async engine in the local endpoint registry for direct in-process calls
+    ///
+    /// The registry is keyed by the short endpoint name (e.g. `"generate"`,
+    /// `"load_lora"`) to match the lookup convention used by other in-process
+    /// consumers such as the LoRA management handlers in
+    /// `system_status_server`.
     pub fn register_local_engine(
         self,
         engine: crate::local_endpoint_registry::LocalAsyncEngine,
@@ -282,6 +287,9 @@ fn build_transport_type_inner(
             endpoint_id,
             connection_id,
         ))),
+        RequestPlaneMode::Local => {
+            Ok(TransportType::Local(endpoint_id.name.clone()))
+        }
     }
 }
 
@@ -310,7 +318,8 @@ pub async fn build_transport_type(
             .and_then(|p| p.parse::<u16>().ok())
             .filter(|&p| p != 0)
             .is_some(),
-        RequestPlaneMode::Nats => true, // NATS doesn't need port init
+        RequestPlaneMode::Nats => true,
+        RequestPlaneMode::Local => true, // No port needed for in-process dispatch
     };
 
     if !has_fixed_port {

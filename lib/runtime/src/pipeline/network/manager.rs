@@ -261,6 +261,12 @@ impl NetworkManager {
                     "Initializing NetworkManager with NATS request plane"
                 );
             }
+            RequestPlaneMode::Local => {
+                tracing::info!(
+                    %mode,
+                    "Initializing NetworkManager in local (in-process) mode — no network transport"
+                );
+            }
         }
 
         Self {
@@ -314,6 +320,9 @@ impl NetworkManager {
             RequestPlaneMode::Http => self.create_http_client(),
             RequestPlaneMode::Tcp => self.create_tcp_client(),
             RequestPlaneMode::Nats => self.create_nats_client(),
+            RequestPlaneMode::Local => Err(anyhow::anyhow!(
+                "RequestPlaneMode::Local does not support network clients — use LocalEndpointRegistry for in-process dispatch"
+            )),
         }
     }
 
@@ -334,6 +343,7 @@ impl NetworkManager {
             RequestPlaneMode::Http => self.create_http_server().await,
             RequestPlaneMode::Tcp => self.create_tcp_server().await,
             RequestPlaneMode::Nats => self.create_nats_server().await,
+            RequestPlaneMode::Local => Ok(Arc::new(NoOpServer) as Arc<dyn RequestPlaneServer>),
         }
     }
 
@@ -467,5 +477,50 @@ impl NetworkManager {
 
         tracing::debug!("Creating NATS request plane client");
         Ok(Arc::new(NatsRequestClient::new(nats_client.clone())))
+    }
+}
+
+/// No-op request plane server for `RequestPlaneMode::Local`.
+///
+/// Accepts endpoint registrations but does not open any network ports.
+/// In local mode, dispatch happens via `LocalEndpointRegistry` instead.
+struct NoOpServer;
+
+#[async_trait::async_trait]
+impl RequestPlaneServer for NoOpServer {
+    async fn register_endpoint(
+        &self,
+        endpoint_name: String,
+        _service_handler: Arc<dyn super::PushWorkHandler>,
+        _instance_id: u64,
+        _namespace: String,
+        _component_name: String,
+        _system_health: Arc<parking_lot::Mutex<crate::SystemHealth>>,
+    ) -> Result<()> {
+        tracing::debug!(
+            endpoint = %endpoint_name,
+            "NoOpServer: endpoint registered (local-only, no network listener)"
+        );
+        Ok(())
+    }
+
+    async fn unregister_endpoint(&self, endpoint_name: &str) -> Result<()> {
+        tracing::debug!(
+            endpoint = %endpoint_name,
+            "NoOpServer: endpoint unregistered"
+        );
+        Ok(())
+    }
+
+    fn address(&self) -> String {
+        "local://in-process".to_string()
+    }
+
+    fn transport_name(&self) -> &'static str {
+        "local"
+    }
+
+    fn is_healthy(&self) -> bool {
+        true
     }
 }

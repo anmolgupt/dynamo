@@ -96,8 +96,9 @@ class DynamoRuntimeArgGroup(ArgGroup):
             flag_name="--request-plane",
             env_var="DYN_REQUEST_PLANE",
             default="tcp",
-            help="Determines how requests are distributed from routers to workers. 'tcp' is fastest.",
-            choices=["tcp", "nats", "http"],
+            help="Determines how requests are distributed from routers to workers. "
+            "'tcp' is fastest for multi-process. 'local' bypasses the network for single-process deployments.",
+            choices=["tcp", "nats", "http", "local"],
         )
         add_argument(
             g,

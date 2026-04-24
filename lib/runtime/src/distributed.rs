@@ -601,14 +601,12 @@ impl DistributedConfig {
     }
 
     /// A DistributedConfig that isn't distributed, for when the frontend and backend are in the
-    /// same process.
+    /// same process. Uses in-memory discovery and local (in-process) request dispatch.
     pub fn process_local() -> DistributedConfig {
         DistributedConfig {
             discovery_backend: DiscoveryBackend::KvStore(kv::Selector::Memory),
             nats_config: None,
-            // This won't be used in process local, so we likely need a "none" option to
-            // communicate that and avoid opening the ports.
-            request_plane: RequestPlaneMode::Tcp,
+            request_plane: RequestPlaneMode::Local,
         }
     }
 }
@@ -619,6 +617,7 @@ impl DistributedConfig {
 /// - `Nats`: Use NATS for request distribution (legacy)
 /// - `Http`: Use HTTP/2 for request distribution
 /// - `Tcp`: Use raw TCP for request distribution with msgpack support (default)
+/// - `Local`: No network transport; use in-process `LocalEndpointRegistry` only
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RequestPlaneMode {
     /// Use NATS for request plane
@@ -628,6 +627,8 @@ pub enum RequestPlaneMode {
     /// Use raw TCP for request plane with msgpack support
     #[default]
     Tcp,
+    /// In-process only — no network transport, dispatch via LocalEndpointRegistry
+    Local,
 }
 
 impl fmt::Display for RequestPlaneMode {
@@ -636,6 +637,7 @@ impl fmt::Display for RequestPlaneMode {
             Self::Nats => write!(f, "nats"),
             Self::Http => write!(f, "http"),
             Self::Tcp => write!(f, "tcp"),
+            Self::Local => write!(f, "local"),
         }
     }
 }
@@ -648,8 +650,9 @@ impl std::str::FromStr for RequestPlaneMode {
             "nats" => Ok(Self::Nats),
             "http" => Ok(Self::Http),
             "tcp" => Ok(Self::Tcp),
+            "local" | "none" => Ok(Self::Local),
             _ => Err(anyhow::anyhow!(
-                "Invalid request plane mode: '{}'. Valid options are: 'nats', 'http', 'tcp'",
+                "Invalid request plane mode: '{}'. Valid options are: 'nats', 'http', 'tcp', 'local'",
                 s
             )),
         }

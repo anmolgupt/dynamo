@@ -673,18 +673,43 @@ impl ModelWatcher {
                     .into_operator();
             let backend = Backend::from_mdc(card).into_operator();
 
-            let router = PushRouter::<
-                PreprocessedEmbeddingRequest,
-                Annotated<EmbeddingsEngineOutput>,
-            >::from_client_with_threshold(
-                client, self.router_config.router_mode, None, None
-            )
-            .await?;
+            // Lookup order for the service backend:
+            //   1. Generic JSON in-process engine via `LocalEngineAdapter`.
+            //      Populated by `Endpoint::serve_endpoint` (the default).
+            //   2. Network `PushRouter` — used when the worker lives in
+            //      another process.
+            //
+            // The local lookup is keyed by the short endpoint name
+            // (e.g. `"generate"`) to match the convention used by the
+            // registrar in `EndpointConfigBuilder::register_local_engine`.
+            let local_engine = self
+                .drt
+                .local_endpoint_registry()
+                .get(&mcid.endpoint);
 
-            // Note: Embeddings don't need KV routing complexity or load monitoring
-            let service_backend = ServiceBackend::from_engine(Arc::new(router));
+            let service_backend = if let Some(engine) = local_engine {
+                tracing::info!(
+                    namespace = %mcid.namespace,
+                    component = %mcid.component,
+                    endpoint = %mcid.endpoint,
+                    "Using JSON in-process dispatch for embedding endpoint"
+                );
+                let adapter = super::local_engine_adapter::LocalEngineAdapter::<
+                    PreprocessedEmbeddingRequest,
+                    EmbeddingsEngineOutput,
+                >::new(engine);
+                ServiceBackend::from_engine(Arc::new(adapter))
+            } else {
+                let router = PushRouter::<
+                    PreprocessedEmbeddingRequest,
+                    Annotated<EmbeddingsEngineOutput>,
+                >::from_client_with_threshold(
+                    client, self.router_config.router_mode, None, None
+                )
+                .await?;
+                ServiceBackend::from_engine(Arc::new(router))
+            };
 
-            // Link the pipeline: frontend -> preprocessor -> backend -> service_backend -> backend -> preprocessor -> frontend
             let embedding_engine = frontend
                 .link(preprocessor.forward_edge())?
                 .link(backend.forward_edge())?
