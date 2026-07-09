@@ -267,7 +267,6 @@ class WorkerFactory:
             runtime=runtime,
             engine=engine_client,
             config=config,
-            vllm_config=vllm_config,
             shutdown_event=shutdown_event,
         )
 

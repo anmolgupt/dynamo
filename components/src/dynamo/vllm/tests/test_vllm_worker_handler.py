@@ -1088,3 +1088,126 @@ class TestClassifyEmbeddingInput:
     def test_unsupported_element_type_rejected(self):
         with pytest.raises(TypeError, match="Unsupported 'input' element"):
             mod._classify_embedding_input([3.14, 2.71])
+
+
+class _RecordingEmbeddingEngine:
+    def __init__(self):
+        self.calls = []
+
+    async def encode(self, **kwargs):
+        self.calls.append(kwargs)
+        prompt = kwargs["prompt"]
+        prompt_token_ids = (
+            [101, 102] if isinstance(prompt, str) else list(prompt["prompt_token_ids"])
+        )
+        output = MagicMock()
+        output.outputs = MagicMock(data=torch.tensor([0.25, 0.75]))
+        output.prompt_token_ids = prompt_token_ids
+        yield output
+
+    async def abort(self, request_id):
+        return None
+
+
+async def _run_embedding_request(request):
+    engine = _RecordingEmbeddingEngine()
+    config = MagicMock()
+    config.served_model_name = "test-model"
+    context = MagicMock()
+    context.id.return_value = "embedding-request"
+    context.async_killed_or_stopped.side_effect = lambda: (
+        asyncio.get_running_loop().create_future()
+    )
+
+    with (
+        patch.object(mod, "VllmEngineMonitor", return_value=MagicMock()),
+        patch.object(mod, "maybe_write_embedding_response_shm", return_value=None),
+    ):
+        handler = mod.EmbeddingWorkerHandler(
+            runtime=MagicMock(),
+            engine=engine,
+            config=config,
+        )
+        responses = [response async for response in handler.generate(request, context)]
+
+    return engine.calls, responses
+
+
+class TestEmbeddingWorkerHandlerTokenization:
+    @pytest.mark.asyncio
+    async def test_text_omits_tokenization_kwargs_by_default(self):
+        calls, responses = await _run_embedding_request(
+            {"model": "test-model", "input": "hello"}
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["prompt"] == "hello"
+        assert "tokenization_kwargs" not in calls[0]
+        assert len(responses[0]["data"]) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("add_special_tokens", [True, False])
+    async def test_text_forwards_explicit_add_special_tokens(self, add_special_tokens):
+        calls, _ = await _run_embedding_request(
+            {
+                "model": "test-model",
+                "input": "hello",
+                "add_special_tokens": add_special_tokens,
+            }
+        )
+
+        assert calls[0]["tokenization_kwargs"] == {
+            "add_special_tokens": add_special_tokens
+        }
+
+    @pytest.mark.asyncio
+    async def test_raw_token_ids_are_never_modified(self):
+        calls, _ = await _run_embedding_request(
+            {
+                "model": "test-model",
+                "input": [7, 8, 9],
+                "add_special_tokens": True,
+            }
+        )
+
+        assert calls[0]["prompt"]["prompt_token_ids"] == [7, 8, 9]
+        assert "tokenization_kwargs" not in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_rust_tokenizer_output_is_never_modified(self):
+        calls, _ = await _run_embedding_request(
+            {
+                "model": "test-model",
+                "token_ids": [[128000, 7, 8, 9]],
+                "add_special_tokens": False,
+            }
+        )
+
+        assert calls[0]["prompt"]["prompt_token_ids"] == [128000, 7, 8, 9]
+        assert "tokenization_kwargs" not in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_text_batch_uses_individual_concurrent_encode_calls(self):
+        calls, responses = await _run_embedding_request(
+            {"model": "test-model", "input": ["first", "second"]}
+        )
+
+        assert [call["prompt"] for call in calls] == ["first", "second"]
+        assert {call["request_id"] for call in calls} == {
+            "embedding-request-0",
+            "embedding-request-1",
+        }
+        assert len(responses[0]["data"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_dimensions_are_delegated_to_vllm_without_worker_clipping(self):
+        calls, responses = await _run_embedding_request(
+            {"model": "test-model", "input": "hello", "dimensions": 1}
+        )
+
+        assert calls[0]["pooling_params"].dimensions == 1
+        # The fake engine deliberately returns two values. The handler must
+        # preserve vLLM's output instead of applying its own post-processing.
+        assert responses[0]["data"][0]["embedding"] == pytest.approx(
+            [0.25, 0.75]
+        )

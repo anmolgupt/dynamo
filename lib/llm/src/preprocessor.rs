@@ -1470,9 +1470,14 @@ impl OpenAIPreprocessor {
         let mut annotations = HashMap::new();
         let mut builder = PreprocessedEmbeddingRequest::builder();
 
+        // Match vLLM's pooling API default for text while leaving caller-supplied
+        // token IDs untouched.
+        let add_special_tokens = request.add_special_tokens.unwrap_or(true);
         let all_token_ids = match &request.inner.input {
             dynamo_protocols::types::EmbeddingInput::String(s) => {
-                let encoding = self.tokenizer.encode(s)?;
+                let encoding = self
+                    .tokenizer
+                    .encode_with_special_tokens(s, add_special_tokens)?;
                 vec![encoding.token_ids().to_vec()]
             }
             dynamo_protocols::types::EmbeddingInput::StringArray(arr) => {
@@ -1481,7 +1486,10 @@ impl OpenAIPreprocessor {
                     let tokenizer = self.tokenizer.clone();
                     let strs = input_strs.clone();
                     move || {
-                        tokenizer.encode_batch(&strs.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                        tokenizer.encode_batch_with_special_tokens(
+                            &strs.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                            add_special_tokens,
+                        )
                     }
                 })
                 .await??;

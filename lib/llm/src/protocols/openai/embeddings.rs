@@ -23,6 +23,13 @@ pub struct NvCreateEmbeddingRequest {
     #[schema(value_type = Object)]
     pub inner: dynamo_protocols::types::CreateEmbeddingRequest,
 
+    /// Whether text inputs should include model-defined special tokens.
+    ///
+    /// This is a vLLM-compatible extension to the OpenAI embeddings request.
+    /// It is ignored for requests that already contain token IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_special_tokens: Option<bool>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nvext: Option<NvExt>,
 
@@ -104,5 +111,34 @@ impl AnnotationsProvider for NvCreateEmbeddingRequest {
             .and_then(|nvext| nvext.annotations.as_ref())
             .map(|annotations| annotations.contains(&annotation.to_string()))
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_add_special_tokens_is_optional() {
+        let request: NvCreateEmbeddingRequest =
+            serde_json::from_str(r#"{"model":"test-model","input":"hello"}"#).unwrap();
+
+        assert_eq!(request.add_special_tokens, None);
+        let serialized = serde_json::to_value(request).unwrap();
+        assert!(serialized.get("add_special_tokens").is_none());
+    }
+
+    #[test]
+    fn embedding_add_special_tokens_accepts_explicit_values() {
+        for expected in [true, false] {
+            let json = format!(
+                r#"{{"model":"test-model","input":"hello","add_special_tokens":{expected}}}"#
+            );
+            let request: NvCreateEmbeddingRequest = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(request.add_special_tokens, Some(expected));
+            let serialized = serde_json::to_value(request).unwrap();
+            assert_eq!(serialized["add_special_tokens"], expected);
+        }
     }
 }

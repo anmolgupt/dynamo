@@ -49,6 +49,35 @@ impl Encoder for HuggingFaceTokenizer {
 
         Ok(encodings)
     }
+
+    fn encode_with_special_tokens(
+        &self,
+        input: &str,
+        add_special_tokens: bool,
+    ) -> Result<Encoding> {
+        let encoding = self
+            .tokenizer
+            .encode(input, add_special_tokens)
+            .map_err(|err| Error::msg(format!("Error tokenizing input: {err}")))?;
+
+        Ok(Encoding::Hf(Box::new(encoding)))
+    }
+
+    fn encode_batch_with_special_tokens(
+        &self,
+        inputs: &[&str],
+        add_special_tokens: bool,
+    ) -> Result<Vec<Encoding>> {
+        let hf_encodings = self
+            .tokenizer
+            .encode_batch(inputs.to_vec(), add_special_tokens)
+            .map_err(|err| Error::msg(format!("Error batch tokenizing input: {err}")))?;
+
+        Ok(hf_encodings
+            .into_iter()
+            .map(|enc| Encoding::Hf(Box::new(enc)))
+            .collect())
+    }
 }
 
 impl Decoder for HuggingFaceTokenizer {
