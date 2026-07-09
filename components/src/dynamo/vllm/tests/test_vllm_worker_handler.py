@@ -1135,7 +1135,8 @@ async def _run_embedding_request(request):
 
 class TestEmbeddingWorkerHandlerTokenization:
     @pytest.mark.asyncio
-    async def test_text_omits_tokenization_kwargs_by_default(self):
+    async def test_text_omits_tokenization_kwargs_by_default(self, monkeypatch):
+        monkeypatch.delenv("DYN_EMBEDDING_ADD_SPECIAL_TOKENS", raising=False)
         calls, responses = await _run_embedding_request(
             {"model": "test-model", "input": "hello"}
         )
@@ -1144,6 +1145,32 @@ class TestEmbeddingWorkerHandlerTokenization:
         assert calls[0]["prompt"] == "hello"
         assert "tokenization_kwargs" not in calls[0]
         assert len(responses[0]["data"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_text_uses_operator_add_special_tokens_default(self, monkeypatch):
+        monkeypatch.setenv("DYN_EMBEDDING_ADD_SPECIAL_TOKENS", "false")
+
+        calls, _ = await _run_embedding_request(
+            {"model": "test-model", "input": "hello"}
+        )
+
+        assert calls[0]["tokenization_kwargs"] == {"add_special_tokens": False}
+
+    @pytest.mark.asyncio
+    async def test_explicit_add_special_tokens_overrides_operator_default(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("DYN_EMBEDDING_ADD_SPECIAL_TOKENS", "true")
+
+        calls, _ = await _run_embedding_request(
+            {
+                "model": "test-model",
+                "input": "hello",
+                "add_special_tokens": False,
+            }
+        )
+
+        assert calls[0]["tokenization_kwargs"] == {"add_special_tokens": False}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("add_special_tokens", [True, False])

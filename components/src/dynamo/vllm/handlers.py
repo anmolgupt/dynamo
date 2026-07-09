@@ -36,7 +36,7 @@ from dynamo.common.multimodal.embedding_transfer import (
     NixlReadEmbeddingReceiver,
     NixlWriteEmbeddingReceiver,
 )
-from dynamo.common.multimodal.embedding_response_shm import (
+from dynamo.common.embedding_shm import (
     apply_embedding_request_shm,
     maybe_write_embedding_response_shm,
     pooling_output_to_tensor,
@@ -53,6 +53,7 @@ from dynamo.common.multimodal.video_loader import VideoLoader
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.common.utils.input_params import InputParamManager
+from dynamo.common.utils.env import optional_env_bool
 from dynamo.common.utils.time_section import time_and_log_code_section
 from dynamo.llm import (
     KvEventPublisher,
@@ -2772,7 +2773,6 @@ class EmbeddingWorkerHandler:
         config: Config,
         shutdown_event: Optional[asyncio.Event] = None,
     ) -> None:
-        self.runtime = runtime
         self.engine_client = engine
         self.config = config
         self.shutdown_event = shutdown_event
@@ -2931,6 +2931,8 @@ class EmbeddingWorkerHandler:
         if add_special_tokens is not None and not isinstance(add_special_tokens, bool):
             raise TypeError("'add_special_tokens' must be a bool when provided")
 
+        if add_special_tokens is None:
+            add_special_tokens = optional_env_bool("DYN_EMBEDDING_ADD_SPECIAL_TOKENS")
         prepared_prompts: list[Any] = []
         for prompt in prompts:
             if isinstance(prompt, str):
@@ -2997,7 +2999,7 @@ class EmbeddingWorkerHandler:
                     }
                 return
             finally:
-                shm_result.handle.close()
+                shm_result.close()
 
         for idx, embedding_tensor in enumerate(embedding_rows):
             embedding_objects.append(
@@ -3125,25 +3127,4 @@ def _classify_embedding_input(input_field: Any) -> list[Any]:
     raise TypeError(
         f"Unsupported 'input' element type {type(first).__name__}; "
         "expected str, int, or list[int]"
-    )
-
-
-def _pooling_output_to_list(data: Any) -> list[float]:
-    """Convert a vLLM PoolingOutput.data tensor (or list) to a flat list[float].
-
-    vLLM's pooling pipeline can return a tensor with a singleton batch dim
-    (shape ``(1, hidden_dim)``) instead of a 1D vector (shape ``(hidden_dim,)``).
-    The OpenAI ``/v1/embeddings`` response expects ``data[].embedding`` to be a
-    flat array of floats, so we flatten unconditionally.
-    """
-    if isinstance(data, torch.Tensor):
-        return data.detach().cpu().flatten().tolist()
-    if isinstance(data, (list, tuple)):
-        # Already a list — flatten one level if it's a list-of-lists.
-        if data and isinstance(data[0], (list, tuple)):
-            return [float(x) for row in data for x in row]
-        return [float(x) for x in data]
-    raise TypeError(
-        f"Unsupported PoolingOutput.data type {type(data).__name__}; "
-        "expected torch.Tensor or list"
     )

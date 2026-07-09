@@ -7,6 +7,7 @@ import os
 import platform
 import random
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -664,6 +665,38 @@ vllm_configs = {
             ),
         ],
     ),
+    "embedding_agg_shm": VLLMConfig(
+        name="embedding_agg_shm",
+        directory=vllm_dir,
+        script_name="agg_embed.sh",
+        marks=[
+            pytest.mark.core,
+            pytest.mark.gpu_1,
+            pytest.mark.profiled_vram_gib(5.0),
+            pytest.mark.requested_vllm_kv_cache_bytes(559_693_824),
+            pytest.mark.timeout(360),
+            pytest.mark.pre_merge,
+        ],
+        model="Qwen/Qwen3-Embedding-0.6B",
+        env={
+            "DYN_EMBEDDING_FRONTEND_TOKENIZATION": "0",
+            "DYN_EMBEDDING_SHM_REQUEST": "1",
+            "DYN_EMBEDDING_SHM_REQUEST_MIN_BYTES": "0",
+            "DYN_EMBEDDING_SHM_RESPONSE": "1",
+            "DYN_EMBEDDING_SHM_MIN_BYTES": "0",
+        },
+        request_payloads=[
+            embedding_payload(
+                input_text=[
+                    "The quick brown fox jumps over the lazy dog.",
+                    "Machine learning is transforming technology.",
+                    "Natural language processing enables computers to understand text.",
+                ],
+                repeat_count=1,
+                expected_response=["Generated 3 embeddings with dimension"],
+            ),
+        ],
+    ),
 }
 
 
@@ -695,6 +728,10 @@ def test_serve_deployment(
         vllm_config_test, frontend_port=dynamo_dynamic_ports.frontend_port
     )
     run_serve_deployment(config, request, ports=dynamo_dynamic_ports)
+    if config.name == "embedding_agg_shm":
+        assert not list(Path("/dev/shm").glob("dyn_embed_*")), (
+            "embedding SHM segments leaked after the serve test"
+        )
 
 
 # LoRA Test Directory

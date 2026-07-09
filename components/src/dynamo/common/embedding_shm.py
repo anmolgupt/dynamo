@@ -1,20 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared-memory transport for embedding response vectors.
+"""Shared-memory transport for embedding requests and response vectors.
 
-This module is intentionally small and typed. It is different from the
-multimodal ``mm_kwargs`` SHM path, which transfers pickled Python objects.
-Embedding responses are dense numeric arrays, so the SHM payload is raw
-contiguous ``float32`` bytes plus JSON metadata sent over Dynamo's normal
-request plane.
+Embedding requests use UTF-8 JSON in SHM. Embedding responses use contiguous
+float32 bytes. In both directions, small versioned metadata stays on Dynamo's
+normal request plane.
 """
 
 from __future__ import annotations
 
 import json
-import struct
 import logging
+from multiprocessing import resource_tracker
 import multiprocessing.shared_memory as shm
 import os
 import time
@@ -26,40 +24,39 @@ import torch
 from pydantic import BaseModel
 from prometheus_client import Counter, Histogram
 
+from dynamo.common.utils.env import env_bool
+
 logger = logging.getLogger(__name__)
 
 _LABELS = ("model", "path", "status")
 _FALLBACK_LABELS = ("model", "path", "reason")
 _DEFAULT_REQUEST_SHM_MAX_BYTES = 256 * 1024 * 1024
+_DEFAULT_RESPONSE_SHM_MAX_BYTES = 256 * 1024 * 1024
 _REQUEST_PAYLOAD_KIND_JSON = "json"
-_REQUEST_PAYLOAD_KIND_TOKEN_IDS_U32_OFFSETS = "token_ids_u32_offsets_v1"
-_TOKEN_IDS_SHM_MAGIC = b"DYNEMBTK"
-_TOKEN_IDS_HEADER = struct.Struct("<8sIII")
-_U32_SIZE = 4
 
 EMBEDDING_SHM_REQUESTS = Counter(
-    "dynamo_embedding_shm_requests_total",
+    "dynamo_worker_embedding_shm_requests_total",
     "Embedding SHM response attempts by status.",
     _LABELS,
 )
 EMBEDDING_SHM_FALLBACKS = Counter(
-    "dynamo_embedding_shm_fallback_total",
+    "dynamo_worker_embedding_shm_fallback_total",
     "Embedding SHM response fallback reasons.",
     _FALLBACK_LABELS,
 )
 EMBEDDING_SHM_BYTES_WRITTEN = Counter(
-    "dynamo_embedding_shm_bytes_written_total",
+    "dynamo_worker_embedding_shm_bytes_written_total",
     "Embedding response bytes written to shared memory.",
     ("model", "path"),
 )
 EMBEDDING_SHM_WRITE_SECONDS = Histogram(
-    "dynamo_embedding_shm_write_seconds",
+    "dynamo_worker_embedding_shm_write_seconds",
     "Time spent writing embedding responses to shared memory.",
     ("model", "path"),
     buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
 )
 EMBEDDING_SHM_CLEANUP_FAILURES = Counter(
-    "dynamo_embedding_shm_cleanup_failures_total",
+    "dynamo_worker_embedding_shm_cleanup_failures_total",
     "Embedding SHM cleanup failures observed by the writer.",
     ("model", "path"),
 )
@@ -93,6 +90,8 @@ class EmbeddingResponseShmMetadata(BaseModel):
 
 
 def _validate_shm_name(name: str) -> None:
+    """Reject unsafe or unrelated POSIX SHM names."""
+
     if (
         not name
         or "/" in name
@@ -120,47 +119,21 @@ def request_shm_max_bytes() -> int:
         return _DEFAULT_REQUEST_SHM_MAX_BYTES
 
 
-def _read_u32_at(data: bytes, offset: int) -> int:
-    return struct.unpack_from("<I", data, offset)[0]
+def response_shm_max_bytes() -> int:
+    """Maximum response SHM payload size written by the Python worker."""
 
-
-def _decode_token_ids_u32_offsets(data: bytes) -> list[list[int]]:
-    if len(data) < _TOKEN_IDS_HEADER.size:
-        raise ValueError(
-            f"typed token request SHM payload too small: {len(data)} bytes"
+    raw = os.environ.get("DYN_EMBEDDING_SHM_RESPONSE_MAX_BYTES")
+    if raw is None:
+        return _DEFAULT_RESPONSE_SHM_MAX_BYTES
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid DYN_EMBEDDING_SHM_RESPONSE_MAX_BYTES=%r; using %d",
+            raw,
+            _DEFAULT_RESPONSE_SHM_MAX_BYTES,
         )
-    magic, version, sequence_count, total_tokens = _TOKEN_IDS_HEADER.unpack_from(data)
-    if magic != _TOKEN_IDS_SHM_MAGIC:
-        raise ValueError(f"invalid typed token SHM magic {magic!r}")
-    if version != 1:
-        raise ValueError(f"unsupported typed token SHM version {version}")
-
-    expected_size = (
-        _TOKEN_IDS_HEADER.size + (sequence_count + 1 + total_tokens) * _U32_SIZE
-    )
-    if len(data) != expected_size:
-        raise ValueError(
-            f"typed token SHM size mismatch: got {len(data)}, expected {expected_size}"
-        )
-
-    offsets_start = _TOKEN_IDS_HEADER.size
-    token_start = offsets_start + (sequence_count + 1) * _U32_SIZE
-    offsets = [
-        _read_u32_at(data, offsets_start + idx * _U32_SIZE)
-        for idx in range(sequence_count + 1)
-    ]
-    if offsets[0] != 0 or offsets[-1] != total_tokens:
-        raise ValueError(
-            f"typed token SHM offsets do not span token payload: {offsets[0]}..{offsets[-1]} vs {total_tokens}"
-        )
-    if any(prev > next_ for prev, next_ in zip(offsets, offsets[1:])):
-        raise ValueError("typed token SHM offsets must be monotonic")
-
-    tokens = [
-        _read_u32_at(data, token_start + idx * _U32_SIZE)
-        for idx in range(total_tokens)
-    ]
-    return [tokens[offsets[idx] : offsets[idx + 1]] for idx in range(sequence_count)]
+        return _DEFAULT_RESPONSE_SHM_MAX_BYTES
 
 
 def apply_embedding_request_shm(request: dict[str, Any]) -> None:
@@ -173,20 +146,12 @@ def apply_embedding_request_shm(request: dict[str, Any]) -> None:
     meta = EmbeddingRequestShmMetadata.model_validate(raw_meta)
     if meta.version != 1:
         raise ValueError(f"unsupported embedding request SHM version {meta.version}")
-    if meta.payload_kind not in (
-        _REQUEST_PAYLOAD_KIND_JSON,
-        _REQUEST_PAYLOAD_KIND_TOKEN_IDS_U32_OFFSETS,
-    ):
+    if meta.payload_kind != _REQUEST_PAYLOAD_KIND_JSON:
         raise ValueError(
             f"unsupported embedding request SHM payload kind {meta.payload_kind!r}"
         )
     if meta.field not in ("input", "token_ids"):
         raise ValueError(f"unsupported embedding request SHM field {meta.field!r}")
-    if (
-        meta.payload_kind == _REQUEST_PAYLOAD_KIND_TOKEN_IDS_U32_OFFSETS
-        and meta.field != "token_ids"
-    ):
-        raise ValueError("typed token request SHM is only valid for token_ids")
     if meta.size_bytes <= 0:
         raise ValueError("embedding request SHM payload is empty")
 
@@ -227,10 +192,7 @@ def apply_embedding_request_shm(request: dict[str, Any]) -> None:
                 f"embedding request SHM segment {meta.name} size mismatch: "
                 f"got {len(data)}, expected {meta.size_bytes}"
             )
-        if meta.payload_kind == _REQUEST_PAYLOAD_KIND_JSON:
-            request[meta.field] = json.loads(data.decode("utf-8"))
-        else:
-            request[meta.field] = _decode_token_ids_u32_offsets(data)
+        request[meta.field] = json.loads(data.decode("utf-8"))
         request.pop("embedding_request_shm", None)
     finally:
         if fd is not None:
@@ -248,16 +210,20 @@ class EmbeddingShmResult:
     metadata: EmbeddingResponseShmMetadata
     handle: shm.SharedMemory
 
+    def close(self) -> None:
+        """Close the writer handle after handing unlink ownership to the consumer."""
+
+        self.handle.close()
+        # SharedMemory always registers creators on Python 3.12. The Rust
+        # frontend is the consumer and unlinks this segment, so keeping the
+        # writer registered causes a false leak warning when the worker exits.
+        resource_tracker.unregister(self.handle._name, "shared_memory")
+
 
 def shm_response_enabled() -> bool:
-    """Return True when embedding response SHM is enabled for this process."""
+    """Return whether embedding response SHM is enabled for this process."""
 
-    return os.environ.get("DYN_EMBEDDING_SHM_RESPONSE", "0").lower() not in (
-        "",
-        "0",
-        "false",
-        "no",
-    )
+    return env_bool("DYN_EMBEDDING_SHM_RESPONSE")
 
 
 def shm_min_bytes() -> int:
@@ -335,6 +301,9 @@ def maybe_write_embedding_response_shm(
         record_shm_fallback(model, path, "small_payload")
         return None
 
+    if size_bytes > response_shm_max_bytes():
+        record_shm_fallback(model, path, "large_payload")
+        return None
     name = f"dyn_embed_resp_{os.getpid()}_{uuid.uuid4().hex[:16]}"
     start = time.perf_counter()
     segment: shm.SharedMemory | None = None
@@ -346,7 +315,7 @@ def maybe_write_embedding_response_shm(
         view.release()
         view = None
     except Exception:
-        EMBEDDING_SHM_REQUESTS.labels(model=model, path=path, status="error").inc()
+        EMBEDDING_SHM_REQUESTS.labels(model=model, path=path, status="fallback").inc()
         EMBEDDING_SHM_FALLBACKS.labels(
             model=model, path=path, reason="write_failed"
         ).inc()

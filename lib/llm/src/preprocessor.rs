@@ -85,6 +85,30 @@ use crate::protocols::common::llm_backend::EmbeddingsEngineOutput;
 pub const ANNOTATION_FORMATTED_PROMPT: &str = "formatted_prompt";
 pub const ANNOTATION_TOKEN_IDS: &str = "token_ids";
 pub const ANNOTATION_LLM_METRICS: &str = "llm_metrics";
+
+fn resolve_embedding_add_special_tokens(
+    request_value: Option<bool>,
+    operator_default: Option<&str>,
+) -> bool {
+    if let Some(value) = request_value {
+        return value;
+    }
+    let Some(raw) = operator_default else {
+        return true;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "" | "0" | "false" | "no" | "off" => false,
+        _ => {
+            tracing::warn!(
+                value = raw,
+                "invalid DYN_EMBEDDING_ADD_SPECIAL_TOKENS; using true"
+            );
+            true
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LLMMetricAnnotation {
     pub input_tokens: usize,
@@ -1472,7 +1496,11 @@ impl OpenAIPreprocessor {
 
         // Match vLLM's pooling API default for text while leaving caller-supplied
         // token IDs untouched.
-        let add_special_tokens = request.add_special_tokens.unwrap_or(true);
+        let operator_default = std::env::var("DYN_EMBEDDING_ADD_SPECIAL_TOKENS").ok();
+        let add_special_tokens = resolve_embedding_add_special_tokens(
+            request.add_special_tokens,
+            operator_default.as_deref(),
+        );
         let all_token_ids = match &request.inner.input {
             dynamo_protocols::types::EmbeddingInput::String(s) => {
                 let encoding = self
@@ -2778,6 +2806,26 @@ mod strip_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_add_special_tokens_precedence() {
+        assert!(resolve_embedding_add_special_tokens(None, None));
+        assert!(!resolve_embedding_add_special_tokens(None, Some("false")));
+        assert!(resolve_embedding_add_special_tokens(None, Some("true")));
+        assert!(!resolve_embedding_add_special_tokens(
+            Some(false),
+            Some("true")
+        ));
+        assert!(resolve_embedding_add_special_tokens(
+            Some(true),
+            Some("false")
+        ));
+    }
+
+    #[test]
+    fn invalid_embedding_add_special_tokens_default_uses_true() {
+        assert!(resolve_embedding_add_special_tokens(None, Some("invalid")));
+    }
 
     /// PRE.1 — `skip_special_tokens` default. See `lib/llm/PREPROCESSOR_CASES.md`.
     #[test]

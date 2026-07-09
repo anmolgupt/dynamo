@@ -8,8 +8,8 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
         LazyLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -20,19 +20,16 @@ use crate::protocols::common::{
     llm_backend::{EmbeddingRequestShmMetadata, EmbeddingResponseShmMetadata},
     preprocessor::PreprocessedEmbeddingRequest,
 };
-use crate::protocols::TokenIdType;
 
 use super::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse};
 
 const REQUEST_PAYLOAD_KIND_JSON: &str = "json";
-const REQUEST_PAYLOAD_KIND_TOKEN_IDS_U32_OFFSETS: &str = "token_ids_u32_offsets_v1";
 const SUPPORTED_VERSION: u32 = 1;
 const FLOAT32_SIZE: usize = 4;
-const U32_SIZE: usize = 4;
-const TOKEN_IDS_SHM_MAGIC: &[u8; 8] = b"DYNEMBTK";
-const TOKEN_IDS_SHM_HEADER_BYTES: usize = 20;
+const DEFAULT_RESPONSE_SHM_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 static REQUEST_SHM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static SHM_SUCCESS_LOGGED: AtomicBool = AtomicBool::new(false);
 
 static REQUEST_SHM_WRITES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
@@ -167,10 +164,6 @@ fn request_shm_enabled() -> bool {
     env_enabled("DYN_EMBEDDING_SHM_REQUEST")
 }
 
-fn typed_token_request_shm_enabled() -> bool {
-    env_enabled("DYN_EMBEDDING_SHM_TYPED_TOKEN_REQUEST")
-}
-
 fn frontend_tokenization_enabled() -> bool {
     env_enabled("DYN_EMBEDDING_FRONTEND_TOKENIZATION")
 }
@@ -180,6 +173,14 @@ fn request_shm_min_bytes() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(65536)
+}
+
+fn response_shm_max_bytes() -> usize {
+    env::var("DYN_EMBEDDING_SHM_RESPONSE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_RESPONSE_SHM_MAX_BYTES)
 }
 
 fn record_request_fallback(model: &str, path: &str, reason: &str) {
@@ -212,7 +213,7 @@ pub fn maybe_write_embedding_request_shm(
     }
     let payload = serde_json::to_vec(&request.inner.input).map_err(|e| {
         REQUEST_SHM_WRITES
-            .with_label_values(&[model.as_str(), path, "error"])
+            .with_label_values(&[model.as_str(), path, "fallback"])
             .inc();
         REQUEST_SHM_FALLBACKS
             .with_label_values(&[model.as_str(), path, "serialize_failed"])
@@ -232,6 +233,8 @@ pub fn maybe_write_embedding_request_shm(
     };
 
     request.embedding_request_shm = Some(meta);
+    // Once the internal SHM descriptor is set, downstream code restores the
+    // original variant before inspecting input. This is only a compact placeholder.
     request.inner.input = dynamo_protocols::types::EmbeddingInput::StringArray(vec![]);
     Ok(true)
 }
@@ -248,37 +251,19 @@ pub fn maybe_write_preprocessed_embedding_request_shm(
         return Ok(false);
     }
 
-    let (payload_kind, payload) = if typed_token_request_shm_enabled() {
-        (
-            REQUEST_PAYLOAD_KIND_TOKEN_IDS_U32_OFFSETS,
-            encode_token_ids_u32_offsets(&request.token_ids).map_err(|e| {
-                REQUEST_SHM_WRITES
-                    .with_label_values(&[model.as_str(), path, "error"])
-                    .inc();
-                REQUEST_SHM_FALLBACKS
-                    .with_label_values(&[model.as_str(), path, "typed_encode_failed"])
-                    .inc();
-                format!("failed to encode embedding token_ids for typed SHM: {e}")
-            })?,
-        )
-    } else {
-        (
-            REQUEST_PAYLOAD_KIND_JSON,
-            serde_json::to_vec(&request.token_ids).map_err(|e| {
-                REQUEST_SHM_WRITES
-                    .with_label_values(&[model.as_str(), path, "error"])
-                    .inc();
-                REQUEST_SHM_FALLBACKS
-                    .with_label_values(&[model.as_str(), path, "serialize_failed"])
-                    .inc();
-                format!("failed to serialize embedding token_ids for SHM: {e}")
-            })?,
-        )
-    };
+    let payload = serde_json::to_vec(&request.token_ids).map_err(|e| {
+        REQUEST_SHM_WRITES
+            .with_label_values(&[model.as_str(), path, "fallback"])
+            .inc();
+        REQUEST_SHM_FALLBACKS
+            .with_label_values(&[model.as_str(), path, "serialize_failed"])
+            .inc();
+        format!("failed to serialize embedding token_ids for SHM: {e}")
+    })?;
     let Some(meta) = write_request_payload(
         model.as_str(),
         path,
-        payload_kind,
+        REQUEST_PAYLOAD_KIND_JSON,
         "token_ids",
         &payload,
         request_id,
@@ -320,7 +305,7 @@ fn write_request_payload(
         .open(&shm_path)
         .map_err(|e| {
             REQUEST_SHM_WRITES
-                .with_label_values(&[model, path, "error"])
+                .with_label_values(&[model, path, "fallback"])
                 .inc();
             REQUEST_SHM_FALLBACKS
                 .with_label_values(&[model, path, "write_failed"])
@@ -330,7 +315,7 @@ fn write_request_payload(
     if let Err(e) = file.write_all(payload) {
         let _ = fs::remove_file(&shm_path);
         REQUEST_SHM_WRITES
-            .with_label_values(&[model, path, "error"])
+            .with_label_values(&[model, path, "fallback"])
             .inc();
         REQUEST_SHM_FALLBACKS
             .with_label_values(&[model, path, "write_failed"])
@@ -369,62 +354,6 @@ fn write_request_payload(
     }))
 }
 
-fn encode_token_ids_u32_offsets(token_ids: &[Vec<TokenIdType>]) -> Result<Vec<u8>, String> {
-    let sequence_count = token_ids.len();
-    if sequence_count > u32::MAX as usize {
-        return Err(format!(
-            "too many token sequences for typed SHM: {sequence_count}"
-        ));
-    }
-
-    let mut total_tokens = 0usize;
-    for row in token_ids {
-        total_tokens = total_tokens
-            .checked_add(row.len())
-            .ok_or_else(|| "token count overflows usize".to_string())?;
-    }
-    if total_tokens > u32::MAX as usize {
-        return Err(format!("too many token IDs for typed SHM: {total_tokens}"));
-    }
-
-    let offset_count = sequence_count
-        .checked_add(1)
-        .ok_or_else(|| "offset count overflows usize".to_string())?;
-    let payload_u32s = offset_count
-        .checked_add(total_tokens)
-        .ok_or_else(|| "typed token payload length overflows usize".to_string())?;
-    let payload_len = TOKEN_IDS_SHM_HEADER_BYTES
-        .checked_add(
-            payload_u32s
-                .checked_mul(U32_SIZE)
-                .ok_or_else(|| "typed token payload byte length overflows usize".to_string())?,
-        )
-        .ok_or_else(|| "typed token payload byte length overflows usize".to_string())?;
-
-    let mut payload = Vec::with_capacity(payload_len);
-    payload.extend_from_slice(TOKEN_IDS_SHM_MAGIC);
-    payload.extend_from_slice(&SUPPORTED_VERSION.to_le_bytes());
-    payload.extend_from_slice(&(sequence_count as u32).to_le_bytes());
-    payload.extend_from_slice(&(total_tokens as u32).to_le_bytes());
-
-    let mut offset = 0u32;
-    payload.extend_from_slice(&offset.to_le_bytes());
-    for row in token_ids {
-        offset = offset
-            .checked_add(row.len() as u32)
-            .ok_or_else(|| "typed token offset overflows u32".to_string())?;
-        payload.extend_from_slice(&offset.to_le_bytes());
-    }
-    for row in token_ids {
-        for token_id in row {
-            payload.extend_from_slice(&token_id.to_le_bytes());
-        }
-    }
-
-    debug_assert_eq!(payload.len(), payload_len);
-    Ok(payload)
-}
-
 /// Expand and clear the internal SHM descriptor on an OpenAI embedding response.
 pub fn expand_embedding_response_shm(
     response: &mut NvCreateEmbeddingResponse,
@@ -460,6 +389,20 @@ pub fn read_embedding_response_shm(meta: &EmbeddingResponseShmMetadata) -> Resul
 
     let path = shm_path(&meta.name)?;
     let start = Instant::now();
+    let max_bytes = response_shm_max_bytes();
+    if meta.size_bytes > max_bytes {
+        let _ = fs::remove_file(&path);
+        SHM_REQUESTS
+            .with_label_values(&[meta.model.as_str(), meta.path.as_str(), "error"])
+            .inc();
+        SHM_FALLBACKS
+            .with_label_values(&[meta.model.as_str(), meta.path.as_str(), "payload_too_large"])
+            .inc();
+        return Err(format!(
+            "embedding SHM response payload is too large: {} bytes, max {}",
+            meta.size_bytes, max_bytes
+        ));
+    }
     let file = File::open(&path).map_err(|e| {
         SHM_REQUESTS
             .with_label_values(&[meta.model.as_str(), meta.path.as_str(), "error"])
@@ -467,7 +410,10 @@ pub fn read_embedding_response_shm(meta: &EmbeddingResponseShmMetadata) -> Resul
         SHM_FALLBACKS
             .with_label_values(&[meta.model.as_str(), meta.path.as_str(), "read_failed"])
             .inc();
-        format!("failed to open embedding SHM segment {}: {e}", meta.name)
+        format!(
+            "failed to open embedding SHM segment {}: {e}; ensure the frontend and worker share the same IPC namespace (/dev/shm)",
+            meta.name
+        )
     })?;
     let max_read = meta.size_bytes.saturating_add(1) as u64;
     let mut bytes = Vec::with_capacity(meta.size_bytes);
@@ -528,6 +474,14 @@ pub fn read_embedding_response_shm(meta: &EmbeddingResponseShmMetadata) -> Resul
     SHM_READ_SECONDS
         .with_label_values(&[meta.model.as_str(), meta.path.as_str()])
         .observe(start.elapsed().as_secs_f64());
+
+    if !SHM_SUCCESS_LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            shm_name = %meta.name,
+            bytes = meta.size_bytes,
+            "embedding SHM transport is working; frontend and worker share /dev/shm"
+        );
+    }
 
     tracing::debug!(
         shm_name = %meta.name,
@@ -685,21 +639,6 @@ mod tests {
     }
 
     #[test]
-    fn encodes_token_ids_u32_offsets_payload() {
-        let payload = encode_token_ids_u32_offsets(&[vec![1, 2, 3], vec![42]]).unwrap();
-
-        assert_eq!(&payload[0..8], TOKEN_IDS_SHM_MAGIC);
-        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(payload[12..16].try_into().unwrap()), 2);
-        assert_eq!(u32::from_le_bytes(payload[16..20].try_into().unwrap()), 4);
-        let values: Vec<u32> = payload[20..]
-            .chunks_exact(U32_SIZE)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect();
-        assert_eq!(values, vec![0, 3, 4, 1, 2, 3, 42]);
-    }
-
-    #[test]
     fn reads_exact_segment_and_unlinks() {
         let mut meta = metadata();
         meta.name = unique_name("dyn_embed_resp_exact_test");
@@ -713,6 +652,21 @@ mod tests {
         let read = read_embedding_response_shm(&meta).unwrap();
 
         assert_eq!(read, bytes);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn rejects_response_payload_over_limit_and_unlinks() {
+        let mut meta = metadata();
+        meta.name = unique_name("dyn_embed_resp_over_limit_test");
+        meta.shape = vec![1, DEFAULT_RESPONSE_SHM_MAX_BYTES / FLOAT32_SIZE + 1];
+        meta.size_bytes = meta.shape[1] * FLOAT32_SIZE;
+        let path = shm_path(&meta.name).unwrap();
+        fs::write(&path, [0u8; 4]).unwrap();
+
+        let err = read_embedding_response_shm(&meta).unwrap_err();
+
+        assert!(err.contains("payload is too large"));
         assert!(!path.exists());
     }
 

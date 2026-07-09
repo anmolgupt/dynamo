@@ -17,6 +17,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 
 from dynamo import prometheus_names
 from dynamo.common.utils.endpoint_types import parse_endpoint_types
+from dynamo.common.utils.env import env_bool
 from dynamo.common.utils.prometheus import (
     LLMBackendMetrics,
     register_embedding_cache_metrics,
@@ -280,10 +281,7 @@ class WorkerFactory:
                 self.register_vllm_model(
                     (
                         ModelInput.Tokens
-                        if os.environ.get(
-                            "DYN_EMBEDDING_FRONTEND_TOKENIZATION", "0"
-                        ).lower()
-                        not in ("", "0", "false", "no")
+                        if env_bool("DYN_EMBEDDING_FRONTEND_TOKENIZATION")
                         else ModelInput.Text
                     ),
                     ModelType.Embedding,
