@@ -36,6 +36,11 @@ from dynamo.common.multimodal.embedding_transfer import (
     NixlReadEmbeddingReceiver,
     NixlWriteEmbeddingReceiver,
 )
+from dynamo.common.multimodal.embedding_response_shm import (
+    apply_embedding_request_shm,
+    maybe_write_embedding_response_shm,
+    pooling_output_to_tensor,
+)
 from dynamo.common.multimodal.image_loader import ImageLoader
 from dynamo.common.multimodal.mm_kwargs_transfer import (
     MmKwargsNixlReceiver,
@@ -2765,6 +2770,7 @@ class EmbeddingWorkerHandler:
         runtime,
         engine: Any,
         config: Config,
+        vllm_config: VllmConfig | None = None,
         shutdown_event: Optional[asyncio.Event] = None,
     ) -> None:
         self.runtime = runtime
@@ -2776,7 +2782,28 @@ class EmbeddingWorkerHandler:
         # crashed pooling engine leaves the endpoint registered and serves
         # failures.
         self.engine_monitor = VllmEngineMonitor(runtime, engine, shutdown_event)
+        self.bos_token_id: int | None = None
+        if vllm_config is not None:
+            bos = getattr(vllm_config.model_config.hf_config, "bos_token_id", None)
+            if bos is not None:
+                self.bos_token_id = int(bos)
+        self.debug_tokens = _env_bool("DYN_EMBED_DEBUG_TOKENS", default=False)
+        self.debug_token_limit = _env_int("DYN_EMBED_DEBUG_TOKEN_LIMIT", default=24)
+        self.request_mode = os.environ.get(
+            "DYN_EMBED_REQUEST_MODE", "concurrent"
+        ).strip().lower()
+        if self.request_mode not in {"sequential", "concurrent", "batch"}:
+            logger.warning(
+                "Unknown DYN_EMBED_REQUEST_MODE=%r; falling back to 'concurrent'",
+                self.request_mode,
+            )
+            self.request_mode = "concurrent"
         logger.info("Embedding worker handler initialized")
+        logger.info(
+            "Embedding worker settings: mode=%s debug_tokens=%s",
+            self.request_mode,
+            self.debug_tokens,
+        )
 
     def cleanup(self) -> None:
         """Release resources owned by this handler.
@@ -2875,22 +2902,30 @@ class EmbeddingWorkerHandler:
     async def generate(
         self, request: dict, context: Context
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Handle one OpenAI /v1/embeddings request.
+        """Handle one embedding request.
 
-        The Rust frontend forwards the request dict directly. Expected keys:
+        In the Text+Embedding path the Rust frontend forwards the OpenAI
+        request dict directly. Expected keys:
         ``model: str``, ``input: str | list[str] | list[int] | list[list[int]]``.
-        Optional ``dimensions`` (Matryoshka truncation; first N floats of each
-        embedding). ``encoding_format=base64`` is not yet supported end-to-end
-        (the Rust response type rejects strings); tracked as a separate
-        follow-up.
+
+        In the Tokens+Embedding path the Rust frontend sends a
+        PreprocessedEmbeddingRequest-shaped dict with ``token_ids`` instead of
+        ``input``. This keeps Rust-side tokenization available for benchmarks
+        and deployments that prefer it.
         """
         # Lazy import to avoid pulling PoolingParams into handlers.py at module
         # load time for non-embedding workers.
         from vllm import PoolingParams
 
+        apply_embedding_request_shm(request)
+
         model_name = request.get("model") or self.config.served_model_name or ""
+        token_ids_batch = request.get("token_ids")
+        is_tokens_path = token_ids_batch is not None
+        response_path = "tokens" if is_tokens_path else "text"
+
         input_field = request.get("input")
-        if input_field is None:
+        if input_field is None and not is_tokens_path:
             raise ValueError("Embedding request missing required 'input' field")
 
         # Per OpenAI spec, `input` can be:
@@ -2901,7 +2936,11 @@ class EmbeddingWorkerHandler:
         # Token-id forms must be passed to vLLM as TokensPrompt so the engine
         # skips its own tokenizer; the previous str()-coercion path turned
         # `[1, 2, 3]` into three text prompts ("1", "2", "3") instead of one.
-        prompts: list[Any] = _classify_embedding_input(input_field)
+        prompts: list[Any] = (
+            _classify_embedding_token_ids(token_ids_batch)
+            if is_tokens_path
+            else _classify_embedding_input(input_field)
+        )
 
         dimensions = request.get("dimensions")
         if dimensions is not None and not isinstance(dimensions, int):
@@ -2912,7 +2951,7 @@ class EmbeddingWorkerHandler:
         if dimensions is not None and dimensions < 1:
             raise ValueError(f"dimensions must be >= 1, got {dimensions}")
 
-        pooling_params = PoolingParams()
+        pooling_params = PoolingParams(task="embed", dimensions=dimensions)
         # Use the per-request context id (same as the chat/completion paths
         # in this file) so concurrent embeddings never collide inside
         # ``AsyncLLM``. ``context.trace_id`` is a distributed-trace id
@@ -2921,48 +2960,153 @@ class EmbeddingWorkerHandler:
         # unique enough to scope a vLLM ``request_id``.
         base_request_id = context.id()
 
-        embedding_objects: list[Dict[str, Any]] = []
-        prompt_tokens = 0
-
+        prepared_prompts: list[Any] = []
         for idx, prompt in enumerate(prompts):
-            request_id = f"{base_request_id}-{idx}"
-            encode_arg: Any = (
-                prompt
-                if isinstance(prompt, str)
-                else TokensPrompt(prompt_token_ids=prompt)
-            )
-            final_output = None
-            async with self._abort_monitor(context, request_id):
-                async for out in self.engine_client.encode(
-                    prompt=encode_arg,
-                    pooling_params=pooling_params,
-                    request_id=request_id,
-                ):
-                    final_output = out
+            if isinstance(prompt, str):
+                prepared_prompts.append(prompt)
+                if self.debug_tokens:
+                    logger.info(
+                        "[embed-debug] idx=%d text_len=%d preview=%r",
+                        idx,
+                        len(prompt),
+                        prompt[:96],
+                    )
+                continue
 
-            if final_output is None:
-                raise RuntimeError(
-                    f"vLLM engine.encode produced no output for input index {idx}"
+            token_ids = list(prompt)
+            original_len = len(token_ids)
+            if self.bos_token_id is not None and (
+                not token_ids or token_ids[0] != self.bos_token_id
+            ):
+                token_ids = [self.bos_token_id] + token_ids
+
+            if self.debug_tokens:
+                logger.info(
+                    "[embed-debug] idx=%d tokens_before=%d tokens_after=%d bos=%s ids=%s",
+                    idx,
+                    original_len,
+                    len(token_ids),
+                    self.bos_token_id,
+                    token_ids[: self.debug_token_limit],
                 )
+            prepared_prompts.append(TokensPrompt(prompt_token_ids=token_ids))
 
-            embedding = _pooling_output_to_list(final_output.outputs.data)
+        final_outputs: list[Any] = []
+        if self.request_mode == "sequential" or len(prepared_prompts) == 1:
+            for idx, encode_arg in enumerate(prepared_prompts):
+                request_id = f"{base_request_id}-{idx}"
+                out = await self._encode_single_request(
+                    context=context,
+                    request_id=request_id,
+                    encode_arg=encode_arg,
+                    pooling_params=pooling_params,
+                )
+                final_outputs.append(out)
+        elif self.request_mode == "concurrent":
+            tasks = [
+                self._encode_single_request(
+                    context=context,
+                    request_id=f"{base_request_id}-{idx}",
+                    encode_arg=encode_arg,
+                    pooling_params=pooling_params,
+                )
+                for idx, encode_arg in enumerate(prepared_prompts)
+            ]
+            final_outputs = await asyncio.gather(*tasks)
+        else:
+            # Experimental: submit the entire embedding batch in one encode() call.
+            # If the backend returns an unexpected shape/count, fall back to
+            # concurrent per-item encode for correctness.
+            try:
+                final_outputs = await self._encode_batch_request(
+                    context=context,
+                    request_id=f"{base_request_id}-batch",
+                    encode_args=prepared_prompts,
+                    pooling_params=pooling_params,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Batch embedding encode failed (%s); falling back to concurrent mode",
+                    e,
+                )
+                tasks = [
+                    self._encode_single_request(
+                        context=context,
+                        request_id=f"{base_request_id}-{idx}",
+                        encode_arg=encode_arg,
+                        pooling_params=pooling_params,
+                    )
+                    for idx, encode_arg in enumerate(prepared_prompts)
+                ]
+                final_outputs = await asyncio.gather(*tasks)
+
+        embedding_objects: list[Dict[str, Any]] = []
+        embedding_rows: list[torch.Tensor] = []
+        prompt_tokens = 0
+        for idx, final_output in enumerate(final_outputs):
+
+            embedding_tensor = pooling_output_to_tensor(final_output.outputs.data)
             if dimensions is not None:
-                if dimensions > len(embedding):
+                if dimensions > embedding_tensor.numel():
                     raise ValueError(
                         f"dimensions={dimensions} exceeds model embedding "
-                        f"dimension {len(embedding)}"
+                        f"dimension {embedding_tensor.numel()}"
                     )
-                embedding = embedding[:dimensions]
+                embedding_tensor = embedding_tensor[:dimensions].contiguous()
 
+            embedding_rows.append(embedding_tensor)
+            token_ids = getattr(final_output, "prompt_token_ids", None) or []
+            prompt_tokens += len(token_ids)
+
+        encoding_format = request.get("encoding_format")
+        embedding_type = request.get("embedding_type", "float")
+        shm_result = maybe_write_embedding_response_shm(
+            embedding_rows,
+            model=model_name,
+            path=response_path,
+            encoding_format=encoding_format,
+            embedding_type=embedding_type,
+        )
+        if shm_result is not None:
+            try:
+                if is_tokens_path:
+                    yield {
+                        "embeddings": [],
+                        "embedding_response_shm": shm_result.metadata.model_dump(),
+                        "prompt_tokens": prompt_tokens,
+                        "total_tokens": prompt_tokens,
+                    }
+                else:
+                    yield {
+                        "object": "list",
+                        "data": [],
+                        "model": model_name,
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "total_tokens": prompt_tokens,
+                        },
+                        "embedding_response_shm": shm_result.metadata.model_dump(),
+                    }
+                return
+            finally:
+                shm_result.handle.close()
+
+        for idx, embedding_tensor in enumerate(embedding_rows):
             embedding_objects.append(
                 {
                     "object": "embedding",
-                    "embedding": embedding,
+                    "embedding": embedding_tensor.tolist(),
                     "index": idx,
                 }
             )
-            token_ids = getattr(final_output, "prompt_token_ids", None) or []
-            prompt_tokens += len(token_ids)
+
+        if is_tokens_path:
+            yield {
+                "embeddings": [row.tolist() for row in embedding_rows],
+                "prompt_tokens": prompt_tokens,
+                "total_tokens": prompt_tokens,
+            }
+            return
 
         yield {
             "object": "list",
@@ -2974,6 +3118,40 @@ class EmbeddingWorkerHandler:
             },
         }
 
+    async def _encode_single_request(
+        self, context: Context, request_id: str, encode_arg: Any, pooling_params: Any
+    ) -> Any:
+        final_output = None
+        async with self._abort_monitor(context, request_id):
+            async for out in self.engine_client.encode(
+                prompt=encode_arg,
+                pooling_params=pooling_params,
+                request_id=request_id,
+            ):
+                final_output = out
+
+        if final_output is None:
+            raise RuntimeError(f"vLLM engine.encode produced no output for {request_id}")
+        return final_output
+
+    async def _encode_batch_request(
+        self, context: Context, request_id: str, encode_args: list[Any], pooling_params: Any
+    ) -> list[Any]:
+        outputs: list[Any] = []
+        async with self._abort_monitor(context, request_id):
+            async for out in self.engine_client.encode(
+                prompt=encode_args,
+                pooling_params=pooling_params,
+                request_id=request_id,
+            ):
+                outputs.append(out)
+
+        if len(outputs) != len(encode_args):
+            raise RuntimeError(
+                f"batch encode returned {len(outputs)} outputs for {len(encode_args)} prompts"
+            )
+        return outputs
+
 
 def _is_token_id(x: Any) -> bool:
     """True iff ``x`` is an int that could be a vLLM token id.
@@ -2982,6 +3160,24 @@ def _is_token_id(x: Any) -> bool:
     accepted as a tokenized prompt.
     """
     return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default=%d", name, value, default)
+        return default
 
 
 def _classify_embedding_input(input_field: Any) -> list[Any]:
@@ -3048,6 +3244,26 @@ def _classify_embedding_input(input_field: Any) -> list[Any]:
         f"Unsupported 'input' element type {type(first).__name__}; "
         "expected str, int, or list[int]"
     )
+
+
+def _classify_embedding_token_ids(token_ids_batch: Any) -> list[list[int]]:
+    """Validate a preprocessed embedding request's ``token_ids`` field."""
+
+    if not isinstance(token_ids_batch, list) or not token_ids_batch:
+        raise TypeError("'token_ids' must be a non-empty list[list[int]]")
+    prompts: list[list[int]] = []
+    for i, item in enumerate(token_ids_batch):
+        if not isinstance(item, list):
+            raise TypeError(f"'token_ids' element at index {i} must be a list[int]")
+        inner: list[int] = []
+        for x in item:
+            if not _is_token_id(x):
+                raise TypeError(
+                    f"'token_ids' element at index {i} contains a non-token id"
+                )
+            inner.append(x)
+        prompts.append(inner)
+    return prompts
 
 
 def _pooling_output_to_list(data: Any) -> list[float]:

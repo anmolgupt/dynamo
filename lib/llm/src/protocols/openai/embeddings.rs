@@ -8,8 +8,14 @@ use validator::Validate;
 
 mod aggregator;
 mod nvext;
+mod shm;
 
 pub use nvext::{NvExt, NvExtProvider};
+pub use shm::{
+    expand_embedding_response_shm, maybe_write_embedding_request_shm,
+    maybe_write_preprocessed_embedding_request_shm, metadata_to_embeddings,
+    read_embedding_response_shm, register_embedding_shm_metrics,
+};
 
 #[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone)]
 pub struct NvCreateEmbeddingRequest {
@@ -19,6 +25,14 @@ pub struct NvCreateEmbeddingRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nvext: Option<NvExt>,
+
+    /// Internal frontend-to-worker SHM descriptor. Clients cannot set this
+    /// field through HTTP deserialization; it is populated only after the
+    /// request has entered Dynamo.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip_deserializing)]
+    #[schema(ignore)]
+    pub embedding_request_shm:
+        Option<crate::protocols::common::llm_backend::EmbeddingRequestShmMetadata>,
 }
 
 /// A response structure for unary chat completion responses, embedding OpenAI's
@@ -32,6 +46,13 @@ pub struct NvCreateEmbeddingResponse {
     #[serde(flatten)]
     #[schema(value_type = Object)]
     pub inner: dynamo_protocols::types::CreateEmbeddingResponse,
+
+    /// Internal worker-to-frontend SHM descriptor. This must be consumed and
+    /// cleared before serializing the response to an HTTP client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
+    pub embedding_response_shm:
+        Option<crate::protocols::common::llm_backend::EmbeddingResponseShmMetadata>,
 }
 
 impl NvCreateEmbeddingResponse {
@@ -46,6 +67,7 @@ impl NvCreateEmbeddingResponse {
                     total_tokens: 0,
                 },
             },
+            embedding_response_shm: None,
         }
     }
 }

@@ -267,6 +267,7 @@ class WorkerFactory:
             runtime=runtime,
             engine=engine_client,
             config=config,
+            vllm_config=vllm_config,
             shutdown_event=shutdown_event,
         )
 
@@ -278,7 +279,14 @@ class WorkerFactory:
                     metrics_labels=[("model", config.model)],
                 ),
                 self.register_vllm_model(
-                    ModelInput.Text,
+                    (
+                        ModelInput.Tokens
+                        if os.environ.get(
+                            "DYN_EMBEDDING_FRONTEND_TOKENIZATION", "0"
+                        ).lower()
+                        not in ("", "0", "false", "no")
+                        else ModelInput.Text
+                    ),
                     ModelType.Embedding,
                     generate_endpoint,
                     config,

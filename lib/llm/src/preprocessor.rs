@@ -66,7 +66,10 @@ use crate::protocols::{
             NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse, jail::JailedStream,
         },
         completions::{NvCreateCompletionRequest, NvCreateCompletionResponse},
-        embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
+        embeddings::{
+            NvCreateEmbeddingRequest, NvCreateEmbeddingResponse,
+            maybe_write_preprocessed_embedding_request_shm,
+        },
         nvext::NvExtProvider,
     },
 };
@@ -1515,7 +1518,16 @@ impl OpenAIPreprocessor {
         builder.annotations(request.annotations().unwrap_or_default());
         builder.mdc_sum(Some(self.mdcsum.clone()));
 
-        Ok((builder.build()?, annotations))
+        let mut preprocessed = builder.build()?;
+        if let Err(err) = maybe_write_preprocessed_embedding_request_shm(
+            &mut preprocessed,
+            "tokens",
+            self.mdcsum.as_str(),
+        ) {
+            tracing::warn!(error = %err, "embedding token request SHM failed; using request-plane payload");
+        }
+
+        Ok((preprocessed, annotations))
     }
 
     pub fn postprocessor_parsing_stream<S>(
@@ -1914,17 +1926,25 @@ impl OpenAIPreprocessor {
     {
         stream.map(move |output| {
             output.map_data(|engine_output| {
-                // Convert engine output to OpenAI response format
-                let embeddings: Vec<dynamo_protocols::types::Embedding> = engine_output
-                    .embeddings
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, embedding)| dynamo_protocols::types::Embedding {
-                        index: index as u32,
-                        object: "embedding".to_string(),
-                        embedding: embedding.into_iter().map(|f| f as f32).collect(),
-                    })
-                    .collect();
+                // Convert engine output to OpenAI response format. When the
+                // worker used response SHM, consume the SHM descriptor here
+                // and avoid deserializing a large nested float array over the
+                // request plane.
+                let embeddings: Vec<dynamo_protocols::types::Embedding> =
+                    if let Some(meta) = engine_output.embedding_response_shm.as_ref() {
+                        crate::protocols::openai::embeddings::metadata_to_embeddings(meta)?
+                    } else {
+                        engine_output
+                            .embeddings
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, embedding)| dynamo_protocols::types::Embedding {
+                                index: index as u32,
+                                object: "embedding".to_string(),
+                                embedding: embedding.into_iter().map(|f| f as f32).collect(),
+                            })
+                            .collect()
+                    };
 
                 let response = NvCreateEmbeddingResponse {
                     inner: dynamo_protocols::types::CreateEmbeddingResponse {
@@ -1936,6 +1956,7 @@ impl OpenAIPreprocessor {
                             total_tokens: engine_output.total_tokens,
                         },
                     },
+                    embedding_response_shm: None,
                 };
 
                 Ok(response)

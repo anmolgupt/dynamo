@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 pub use super::FinishReason;
 pub use super::preprocessor::PreprocessedRequest;
@@ -297,11 +298,54 @@ impl MaybeError for LLMEngineOutput {
     }
 }
 
+/// Metadata for an embedding request payload stored in POSIX shared memory.
+///
+/// The payload is versioned independently from response SHM and currently
+/// contains UTF-8 JSON for either the raw OpenAI `input` field or the
+/// Rust-tokenized `token_ids` field. All other request fields stay on the
+/// normal request plane so vLLM feature flags such as `dimensions` continue
+/// to flow without SHM-specific handling.
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, PartialEq)]
+pub struct EmbeddingRequestShmMetadata {
+    pub version: u32,
+    pub model: String,
+    pub path: String,
+    pub name: String,
+    pub size_bytes: usize,
+    pub payload_kind: String,
+    pub field: String,
+}
+
+/// Metadata for an embedding response stored in POSIX shared memory.
+///
+/// The payload is raw contiguous `float32` bytes with shape
+/// `[batch_size, embedding_dim]`. The request plane carries this small
+/// descriptor while the Rust frontend reads and unlinks the SHM segment before
+/// returning the final OpenAI response.
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, PartialEq)]
+pub struct EmbeddingResponseShmMetadata {
+    pub version: u32,
+    pub model: String,
+    pub path: String,
+    pub name: String,
+    pub size_bytes: usize,
+    pub dtype: String,
+    pub endianness: String,
+    pub shape: Vec<usize>,
+    pub embedding_type: String,
+    pub encoding_format: String,
+}
+
 /// Raw output from embedding engines containing embedding vectors
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct EmbeddingsEngineOutput {
     /// Generated embedding vectors (one per input text)
+    #[serde(default)]
     pub embeddings: Vec<Vec<f64>>,
+
+    /// Optional shared-memory descriptor for dense embedding bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_response_shm: Option<EmbeddingResponseShmMetadata>,
 
     /// Token usage information
     pub prompt_tokens: u32,
