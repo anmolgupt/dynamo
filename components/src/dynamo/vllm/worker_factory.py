@@ -41,7 +41,7 @@ from .publisher import StatLoggerFactory
 
 logger = logging.getLogger(__name__)
 
-# (engine_client, vllm_config, default_sampling_params, prometheus_temp_dir, component_gauges)
+# (engine_client, vllm_config, default_sampling_params, cleanup_resource, component_gauges)
 EngineSetupResult = tuple[AsyncLLM, VllmConfig, Any, Any, LLMBackendMetrics]
 
 
@@ -260,7 +260,7 @@ class WorkerFactory:
             engine_client,
             vllm_config,
             _default_sampling_params,
-            _prometheus_temp_dir,
+            engine_cleanup_resource,
             _component_gauges,
         ) = self.setup_vllm_engine(config, factory, fpm_worker_id=fpm_worker_id)
 
@@ -301,6 +301,18 @@ class WorkerFactory:
             raise
         finally:
             handler.cleanup()
+            # Attached multi-client AsyncLLMs do not own EngineCore. Close all
+            # clients first, then let the parent cleanup resource terminate
+            # child endpoints and finally the shared EngineCore.
+            try:
+                engine_client.shutdown()
+            except Exception:
+                logger.exception("Failed to shut down embedding AsyncLLM client")
+            if engine_cleanup_resource is not None:
+                try:
+                    engine_cleanup_resource.cleanup()
+                except Exception:
+                    logger.exception("Failed to clean up embedding engine resources")
 
     async def _maybe_wait_for_failover_lock(
         self,

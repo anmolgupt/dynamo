@@ -4,7 +4,7 @@
 """Unit tests for worker_factory.py"""
 
 import asyncio
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -149,3 +149,61 @@ class TestCreate:
             shutdown_endpoints,
             snapshot_engine=snapshot_engine,
         )
+
+
+@pytest.mark.asyncio
+async def test_embedding_worker_cleans_up_engine_resources_in_order() -> None:
+    cleanup_order: list[str] = []
+    endpoint = Mock()
+    endpoint.connection_id.return_value = "embedding-worker-id"
+    endpoint.serve_endpoint = AsyncMock(return_value=None)
+    runtime = Mock()
+    runtime.endpoint.return_value = endpoint
+
+    engine_client = Mock()
+    engine_client.shutdown.side_effect = lambda: cleanup_order.append("client")
+    engine_cleanup_resource = Mock()
+    engine_cleanup_resource.cleanup.side_effect = lambda: cleanup_order.append(
+        "resource"
+    )
+    setup_vllm_engine = Mock(
+        return_value=(
+            engine_client,
+            Mock(),
+            Mock(),
+            engine_cleanup_resource,
+            Mock(),
+        )
+    )
+    factory = WorkerFactory(
+        setup_vllm_engine_fn=setup_vllm_engine,
+        setup_kv_event_publisher_fn=Mock(),
+        register_vllm_model_fn=AsyncMock(return_value=None),
+        setup_fpm_relay_fn=Mock(),
+        setup_metrics_collection_fn=Mock(),
+    )
+    handler = Mock()
+    handler.cleanup.side_effect = lambda: cleanup_order.append("handler")
+    config = _make_config(
+        embedding_worker=True,
+        namespace="dynamo",
+        component="backend",
+        endpoint="generate",
+        model="test-model",
+    )
+    shutdown_event = asyncio.Event()
+    shutdown_endpoints: list = []
+
+    with patch(
+        "dynamo.vllm.worker_factory.EmbeddingWorkerHandler",
+        return_value=handler,
+    ):
+        await factory._create_embedding_worker(
+            runtime,
+            config,
+            shutdown_event,
+            shutdown_endpoints,
+        )
+
+    assert cleanup_order == ["handler", "client", "resource"]
+    assert shutdown_endpoints == [endpoint]
