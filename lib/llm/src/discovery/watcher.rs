@@ -1035,7 +1035,11 @@ impl ModelWatcher {
                 ManyOut<Annotated<NvCreateEmbeddingResponse>>,
             >::new();
 
-            let preprocessor = OpenAIPreprocessor::new(card.clone())?.into_operator();
+            let tk = card.tokenizer().context("tokenizer")?;
+            let formatter = PromptFormatter::no_op();
+            let PromptFormatter::OAI(formatter) = formatter;
+            let preprocessor =
+                OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tk)?.into_operator();
             let backend = Backend::from_mdc(card).into_operator();
 
             let router = PushRouter::<

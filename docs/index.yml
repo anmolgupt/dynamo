@@ -452,6 +452,8 @@ navigation:
       # -- Reference --
       - page: Tuning Disaggregated Performance
         path: performance/tuning.md
+      - page: Embedding Shared-Memory Transport
+        path: performance/embedding-shm.md
       # -- Frontend (hidden sub-pages) --
       - page: NVIDIA Request Extensions (nvext)
         path: components/frontend/nvext.md

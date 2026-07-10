@@ -66,7 +66,10 @@ use crate::protocols::{
             NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse, jail::JailedStream,
         },
         completions::{NvCreateCompletionRequest, NvCreateCompletionResponse},
-        embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
+        embeddings::{
+            NvCreateEmbeddingRequest, NvCreateEmbeddingResponse,
+            maybe_write_preprocessed_embedding_request_shm,
+        },
         nvext::NvExtProvider,
     },
 };
@@ -82,6 +85,30 @@ use crate::protocols::common::llm_backend::EmbeddingsEngineOutput;
 pub const ANNOTATION_FORMATTED_PROMPT: &str = "formatted_prompt";
 pub const ANNOTATION_TOKEN_IDS: &str = "token_ids";
 pub const ANNOTATION_LLM_METRICS: &str = "llm_metrics";
+
+fn resolve_embedding_add_special_tokens(
+    request_value: Option<bool>,
+    operator_default: Option<&str>,
+) -> bool {
+    if let Some(value) = request_value {
+        return value;
+    }
+    let Some(raw) = operator_default else {
+        return true;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "" | "0" | "false" | "no" | "off" => false,
+        _ => {
+            tracing::warn!(
+                value = raw,
+                "invalid DYN_EMBEDDING_ADD_SPECIAL_TOKENS; using true"
+            );
+            true
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LLMMetricAnnotation {
     pub input_tokens: usize,
@@ -1467,9 +1494,18 @@ impl OpenAIPreprocessor {
         let mut annotations = HashMap::new();
         let mut builder = PreprocessedEmbeddingRequest::builder();
 
+        // Match vLLM's pooling API default for text while leaving caller-supplied
+        // token IDs untouched.
+        let operator_default = std::env::var("DYN_EMBEDDING_ADD_SPECIAL_TOKENS").ok();
+        let add_special_tokens = resolve_embedding_add_special_tokens(
+            request.add_special_tokens,
+            operator_default.as_deref(),
+        );
         let all_token_ids = match &request.inner.input {
             dynamo_protocols::types::EmbeddingInput::String(s) => {
-                let encoding = self.tokenizer.encode(s)?;
+                let encoding = self
+                    .tokenizer
+                    .encode_with_special_tokens(s, add_special_tokens)?;
                 vec![encoding.token_ids().to_vec()]
             }
             dynamo_protocols::types::EmbeddingInput::StringArray(arr) => {
@@ -1478,7 +1514,10 @@ impl OpenAIPreprocessor {
                     let tokenizer = self.tokenizer.clone();
                     let strs = input_strs.clone();
                     move || {
-                        tokenizer.encode_batch(&strs.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                        tokenizer.encode_batch_with_special_tokens(
+                            &strs.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                            add_special_tokens,
+                        )
                     }
                 })
                 .await??;
@@ -1515,7 +1554,16 @@ impl OpenAIPreprocessor {
         builder.annotations(request.annotations().unwrap_or_default());
         builder.mdc_sum(Some(self.mdcsum.clone()));
 
-        Ok((builder.build()?, annotations))
+        let mut preprocessed = builder.build()?;
+        if let Err(err) = maybe_write_preprocessed_embedding_request_shm(
+            &mut preprocessed,
+            "tokens",
+            self.mdcsum.as_str(),
+        ) {
+            tracing::warn!(error = %err, "embedding token request SHM failed; using request-plane payload");
+        }
+
+        Ok((preprocessed, annotations))
     }
 
     pub fn postprocessor_parsing_stream<S>(
@@ -1914,17 +1962,25 @@ impl OpenAIPreprocessor {
     {
         stream.map(move |output| {
             output.map_data(|engine_output| {
-                // Convert engine output to OpenAI response format
-                let embeddings: Vec<dynamo_protocols::types::Embedding> = engine_output
-                    .embeddings
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, embedding)| dynamo_protocols::types::Embedding {
-                        index: index as u32,
-                        object: "embedding".to_string(),
-                        embedding: embedding.into_iter().map(|f| f as f32).collect(),
-                    })
-                    .collect();
+                // Convert engine output to OpenAI response format. When the
+                // worker used response SHM, consume the SHM descriptor here
+                // and avoid deserializing a large nested float array over the
+                // request plane.
+                let embeddings: Vec<dynamo_protocols::types::Embedding> =
+                    if let Some(meta) = engine_output.embedding_response_shm.as_ref() {
+                        crate::protocols::openai::embeddings::metadata_to_embeddings(meta)?
+                    } else {
+                        engine_output
+                            .embeddings
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, embedding)| dynamo_protocols::types::Embedding {
+                                index: index as u32,
+                                object: "embedding".to_string(),
+                                embedding: embedding.into_iter().map(|f| f as f32).collect(),
+                            })
+                            .collect()
+                    };
 
                 let response = NvCreateEmbeddingResponse {
                     inner: dynamo_protocols::types::CreateEmbeddingResponse {
@@ -1936,6 +1992,7 @@ impl OpenAIPreprocessor {
                             total_tokens: engine_output.total_tokens,
                         },
                     },
+                    embedding_response_shm: None,
                 };
 
                 Ok(response)
@@ -2749,6 +2806,26 @@ mod strip_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_add_special_tokens_precedence() {
+        assert!(resolve_embedding_add_special_tokens(None, None));
+        assert!(!resolve_embedding_add_special_tokens(None, Some("false")));
+        assert!(resolve_embedding_add_special_tokens(None, Some("true")));
+        assert!(!resolve_embedding_add_special_tokens(
+            Some(false),
+            Some("true")
+        ));
+        assert!(resolve_embedding_add_special_tokens(
+            Some(true),
+            Some("false")
+        ));
+    }
+
+    #[test]
+    fn invalid_embedding_add_special_tokens_default_uses_true() {
+        assert!(resolve_embedding_add_special_tokens(None, Some("invalid")));
+    }
 
     /// PRE.1 — `skip_special_tokens` default. See `lib/llm/PREPROCESSOR_CASES.md`.
     #[test]

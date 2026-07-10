@@ -63,6 +63,22 @@ pub mod traits {
     pub trait Encoder: Send + Sync {
         fn encode(&self, input: &str) -> Result<Encoding>;
         fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>>;
+
+        fn encode_with_special_tokens(
+            &self,
+            input: &str,
+            _add_special_tokens: bool,
+        ) -> Result<Encoding> {
+            self.encode(input)
+        }
+
+        fn encode_batch_with_special_tokens(
+            &self,
+            inputs: &[&str],
+            _add_special_tokens: bool,
+        ) -> Result<Vec<Encoding>> {
+            self.encode_batch(inputs)
+        }
     }
 
     /// Result of decoding token IDs to text.

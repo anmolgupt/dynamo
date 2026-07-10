@@ -36,6 +36,11 @@ from dynamo.common.multimodal.embedding_transfer import (
     NixlReadEmbeddingReceiver,
     NixlWriteEmbeddingReceiver,
 )
+from dynamo.common.embedding_shm import (
+    apply_embedding_request_shm,
+    maybe_write_embedding_response_shm,
+    pooling_output_to_tensor,
+)
 from dynamo.common.multimodal.image_loader import ImageLoader
 from dynamo.common.multimodal.mm_kwargs_transfer import (
     MmKwargsNixlReceiver,
@@ -48,6 +53,7 @@ from dynamo.common.multimodal.video_loader import VideoLoader
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.common.utils.input_params import InputParamManager
+from dynamo.common.utils.env import optional_env_bool
 from dynamo.common.utils.time_section import time_and_log_code_section
 from dynamo.llm import (
     KvEventPublisher,
@@ -2767,7 +2773,6 @@ class EmbeddingWorkerHandler:
         config: Config,
         shutdown_event: Optional[asyncio.Event] = None,
     ) -> None:
-        self.runtime = runtime
         self.engine_client = engine
         self.config = config
         self.shutdown_event = shutdown_event
@@ -2875,23 +2880,32 @@ class EmbeddingWorkerHandler:
     async def generate(
         self, request: dict, context: Context
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Handle one OpenAI /v1/embeddings request.
+        """Handle one embedding request.
 
-        The Rust frontend forwards the request dict directly. Expected keys:
+        In the Text+Embedding path the Rust frontend forwards the OpenAI
+        request dict directly. Expected keys:
         ``model: str``, ``input: str | list[str] | list[int] | list[list[int]]``.
-        Optional ``dimensions`` (Matryoshka truncation; first N floats of each
-        embedding). ``encoding_format=base64`` is not yet supported end-to-end
-        (the Rust response type rejects strings); tracked as a separate
-        follow-up.
+
+        In the Tokens+Embedding path the Rust frontend sends a
+        PreprocessedEmbeddingRequest-shaped dict with ``token_ids`` instead of
+        ``input``. This keeps Rust-side tokenization available for benchmarks
+        and deployments that prefer it.
         """
         # Lazy import to avoid pulling PoolingParams into handlers.py at module
         # load time for non-embedding workers.
         from vllm import PoolingParams
 
+        apply_embedding_request_shm(request)
+
         model_name = request.get("model") or self.config.served_model_name or ""
-        input_field = request.get("input")
+        token_ids_batch = request.get("token_ids")
+        is_tokens_path = token_ids_batch is not None
+        response_path = "tokens" if is_tokens_path else "text"
+
+        input_field = token_ids_batch if is_tokens_path else request.get("input")
         if input_field is None:
-            raise ValueError("Embedding request missing required 'input' field")
+            field_name = "token_ids" if is_tokens_path else "input"
+            raise ValueError(f"Embedding request missing required '{field_name}' field")
 
         # Per OpenAI spec, `input` can be:
         #   - str           : single text prompt
@@ -2901,18 +2915,10 @@ class EmbeddingWorkerHandler:
         # Token-id forms must be passed to vLLM as TokensPrompt so the engine
         # skips its own tokenizer; the previous str()-coercion path turned
         # `[1, 2, 3]` into three text prompts ("1", "2", "3") instead of one.
-        prompts: list[Any] = _classify_embedding_input(input_field)
+        prompts = _classify_embedding_input(input_field)
 
         dimensions = request.get("dimensions")
-        if dimensions is not None and not isinstance(dimensions, int):
-            raise TypeError(
-                f"Invalid 'dimensions' type {type(dimensions).__name__}; "
-                "expected int"
-            )
-        if dimensions is not None and dimensions < 1:
-            raise ValueError(f"dimensions must be >= 1, got {dimensions}")
-
-        pooling_params = PoolingParams()
+        pooling_params = PoolingParams(task="embed", dimensions=dimensions)
         # Use the per-request context id (same as the chat/completion paths
         # in this file) so concurrent embeddings never collide inside
         # ``AsyncLLM``. ``context.trace_id`` is a distributed-trace id
@@ -2921,48 +2927,96 @@ class EmbeddingWorkerHandler:
         # unique enough to scope a vLLM ``request_id``.
         base_request_id = context.id()
 
-        embedding_objects: list[Dict[str, Any]] = []
-        prompt_tokens = 0
+        add_special_tokens = request.get("add_special_tokens")
+        if add_special_tokens is not None and not isinstance(add_special_tokens, bool):
+            raise TypeError("'add_special_tokens' must be a bool when provided")
 
-        for idx, prompt in enumerate(prompts):
-            request_id = f"{base_request_id}-{idx}"
-            encode_arg: Any = (
-                prompt
-                if isinstance(prompt, str)
-                else TokensPrompt(prompt_token_ids=prompt)
+        if add_special_tokens is None:
+            add_special_tokens = optional_env_bool("DYN_EMBEDDING_ADD_SPECIAL_TOKENS")
+        prepared_prompts: list[Any] = []
+        for prompt in prompts:
+            if isinstance(prompt, str):
+                prepared_prompts.append(prompt)
+            else:
+                # Caller-provided token IDs, including the Rust-tokenized path,
+                # are already final. Never prepend a model-specific BOS here.
+                prepared_prompts.append(TokensPrompt(prompt_token_ids=list(prompt)))
+
+        # AsyncLLM.encode accepts one prompt at a time. Submitting all items
+        # concurrently lets vLLM's scheduler batch them internally.
+        tokenization_kwargs = None
+        if isinstance(prepared_prompts[0], str) and add_special_tokens is not None:
+            tokenization_kwargs = {"add_special_tokens": add_special_tokens}
+        tasks = [
+            self._encode_single_request(
+                context=context,
+                request_id=f"{base_request_id}-{idx}",
+                encode_arg=encode_arg,
+                pooling_params=pooling_params,
+                tokenization_kwargs=tokenization_kwargs,
             )
-            final_output = None
-            async with self._abort_monitor(context, request_id):
-                async for out in self.engine_client.encode(
-                    prompt=encode_arg,
-                    pooling_params=pooling_params,
-                    request_id=request_id,
-                ):
-                    final_output = out
+            for idx, encode_arg in enumerate(prepared_prompts)
+        ]
+        final_outputs = await asyncio.gather(*tasks)
 
-            if final_output is None:
-                raise RuntimeError(
-                    f"vLLM engine.encode produced no output for input index {idx}"
-                )
+        embedding_objects: list[Dict[str, Any]] = []
+        embedding_rows: list[torch.Tensor] = []
+        prompt_tokens = 0
+        for idx, final_output in enumerate(final_outputs):
+            embedding_tensor = pooling_output_to_tensor(final_output.outputs.data)
+            embedding_rows.append(embedding_tensor)
+            token_ids = getattr(final_output, "prompt_token_ids", None) or []
+            prompt_tokens += len(token_ids)
 
-            embedding = _pooling_output_to_list(final_output.outputs.data)
-            if dimensions is not None:
-                if dimensions > len(embedding):
-                    raise ValueError(
-                        f"dimensions={dimensions} exceeds model embedding "
-                        f"dimension {len(embedding)}"
-                    )
-                embedding = embedding[:dimensions]
+        encoding_format = request.get("encoding_format")
+        embedding_type = request.get("embedding_type", "float")
+        shm_result = maybe_write_embedding_response_shm(
+            embedding_rows,
+            model=model_name,
+            path=response_path,
+            encoding_format=encoding_format,
+            embedding_type=embedding_type,
+        )
+        if shm_result is not None:
+            try:
+                if is_tokens_path:
+                    yield {
+                        "embeddings": [],
+                        "embedding_response_shm": shm_result.metadata.model_dump(),
+                        "prompt_tokens": prompt_tokens,
+                        "total_tokens": prompt_tokens,
+                    }
+                else:
+                    yield {
+                        "object": "list",
+                        "data": [],
+                        "model": model_name,
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "total_tokens": prompt_tokens,
+                        },
+                        "embedding_response_shm": shm_result.metadata.model_dump(),
+                    }
+                return
+            finally:
+                shm_result.close()
 
+        for idx, embedding_tensor in enumerate(embedding_rows):
             embedding_objects.append(
                 {
                     "object": "embedding",
-                    "embedding": embedding,
+                    "embedding": embedding_tensor.tolist(),
                     "index": idx,
                 }
             )
-            token_ids = getattr(final_output, "prompt_token_ids", None) or []
-            prompt_tokens += len(token_ids)
+
+        if is_tokens_path:
+            yield {
+                "embeddings": [row.tolist() for row in embedding_rows],
+                "prompt_tokens": prompt_tokens,
+                "total_tokens": prompt_tokens,
+            }
+            return
 
         yield {
             "object": "list",
@@ -2973,6 +3027,32 @@ class EmbeddingWorkerHandler:
                 "total_tokens": prompt_tokens,
             },
         }
+
+    async def _encode_single_request(
+        self,
+        context: Context,
+        request_id: str,
+        encode_arg: Any,
+        pooling_params: Any,
+        tokenization_kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        final_output = None
+        encode_kwargs = {
+            "prompt": encode_arg,
+            "pooling_params": pooling_params,
+            "request_id": request_id,
+        }
+        if tokenization_kwargs is not None:
+            encode_kwargs["tokenization_kwargs"] = tokenization_kwargs
+        async with self._abort_monitor(context, request_id):
+            async for out in self.engine_client.encode(**encode_kwargs):
+                final_output = out
+
+        if final_output is None:
+            raise RuntimeError(
+                f"vLLM engine.encode produced no output for {request_id}"
+            )
+        return final_output
 
 
 def _is_token_id(x: Any) -> bool:
@@ -3047,25 +3127,4 @@ def _classify_embedding_input(input_field: Any) -> list[Any]:
     raise TypeError(
         f"Unsupported 'input' element type {type(first).__name__}; "
         "expected str, int, or list[int]"
-    )
-
-
-def _pooling_output_to_list(data: Any) -> list[float]:
-    """Convert a vLLM PoolingOutput.data tensor (or list) to a flat list[float].
-
-    vLLM's pooling pipeline can return a tensor with a singleton batch dim
-    (shape ``(1, hidden_dim)``) instead of a 1D vector (shape ``(hidden_dim,)``).
-    The OpenAI ``/v1/embeddings`` response expects ``data[].embedding`` to be a
-    flat array of floats, so we flatten unconditionally.
-    """
-    if isinstance(data, torch.Tensor):
-        return data.detach().cpu().flatten().tolist()
-    if isinstance(data, (list, tuple)):
-        # Already a list — flatten one level if it's a list-of-lists.
-        if data and isinstance(data[0], (list, tuple)):
-            return [float(x) for row in data for x in row]
-        return [float(x) for x in data]
-    raise TypeError(
-        f"Unsupported PoolingOutput.data type {type(data).__name__}; "
-        "expected torch.Tensor or list"
     )

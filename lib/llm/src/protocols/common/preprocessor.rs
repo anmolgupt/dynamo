@@ -351,6 +351,12 @@ pub struct PreprocessedEmbeddingRequest {
     /// Number of dimensions for output embeddings (if supported)
     pub dimensions: Option<u32>,
 
+    /// Optional shared-memory descriptor for tokenized embedding request bytes.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_request_shm:
+        Option<crate::protocols::common::llm_backend::EmbeddingRequestShmMetadata>,
+
     /// The computed checksum of the Model Deployment Card (MDC)
     #[builder(default)]
     pub mdc_sum: Option<String>,

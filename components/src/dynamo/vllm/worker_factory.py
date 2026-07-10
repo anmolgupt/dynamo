@@ -17,6 +17,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 
 from dynamo import prometheus_names
 from dynamo.common.utils.endpoint_types import parse_endpoint_types
+from dynamo.common.utils.env import env_bool
 from dynamo.common.utils.prometheus import (
     LLMBackendMetrics,
     register_embedding_cache_metrics,
@@ -40,7 +41,7 @@ from .publisher import StatLoggerFactory
 
 logger = logging.getLogger(__name__)
 
-# (engine_client, vllm_config, default_sampling_params, prometheus_temp_dir, component_gauges)
+# (engine_client, vllm_config, default_sampling_params, cleanup_resource, component_gauges)
 EngineSetupResult = tuple[AsyncLLM, VllmConfig, Any, Any, LLMBackendMetrics]
 
 
@@ -259,7 +260,7 @@ class WorkerFactory:
             engine_client,
             vllm_config,
             _default_sampling_params,
-            _prometheus_temp_dir,
+            engine_cleanup_resource,
             _component_gauges,
         ) = self.setup_vllm_engine(config, factory, fpm_worker_id=fpm_worker_id)
 
@@ -278,7 +279,11 @@ class WorkerFactory:
                     metrics_labels=[("model", config.model)],
                 ),
                 self.register_vllm_model(
-                    ModelInput.Text,
+                    (
+                        ModelInput.Tokens
+                        if env_bool("DYN_EMBEDDING_FRONTEND_TOKENIZATION")
+                        else ModelInput.Text
+                    ),
                     ModelType.Embedding,
                     generate_endpoint,
                     config,
@@ -296,6 +301,18 @@ class WorkerFactory:
             raise
         finally:
             handler.cleanup()
+            # Attached multi-client AsyncLLMs do not own EngineCore. Close all
+            # clients first, then let the parent cleanup resource terminate
+            # child endpoints and finally the shared EngineCore.
+            try:
+                engine_client.shutdown()
+            except Exception:
+                logger.exception("Failed to shut down embedding AsyncLLM client")
+            if engine_cleanup_resource is not None:
+                try:
+                    engine_cleanup_resource.cleanup()
+                except Exception:
+                    logger.exception("Failed to clean up embedding engine resources")
 
     async def _maybe_wait_for_failover_lock(
         self,

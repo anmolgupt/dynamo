@@ -236,6 +236,28 @@ The Dynamo HTTP Frontend (`python -m dynamo.frontend`) exposes `dynamo_frontend_
 curl http://localhost:8000/metrics
 ```
 
+#### Embedding SHM metrics
+
+When [embedding shared-memory transport](../performance/embedding-shm.md) is
+enabled, the frontend exposes these metric families:
+
+- `dynamo_frontend_embedding_request_shm_writes_total`
+- `dynamo_frontend_embedding_request_shm_bytes_written_total`
+- `dynamo_frontend_embedding_request_shm_write_seconds`
+- `dynamo_frontend_embedding_request_shm_fallback_total`
+- `dynamo_frontend_embedding_shm_requests_total`
+- `dynamo_frontend_embedding_shm_bytes_read_total`
+- `dynamo_frontend_embedding_shm_read_seconds`
+- `dynamo_frontend_embedding_shm_fallback_total`
+- `dynamo_frontend_embedding_shm_cleanup_failures_total`
+
+The vLLM embedding worker exposes `dynamo_worker_embedding_shm_requests_total`,
+`dynamo_worker_embedding_shm_fallback_total`,
+`dynamo_worker_embedding_shm_bytes_written_total`,
+`dynamo_worker_embedding_shm_write_seconds`, and
+`dynamo_worker_embedding_shm_cleanup_failures_total` on its system metrics
+port.
+
 #### Stage and phase labels
 
 `dynamo_frontend_stage_requests` decomposes the lifetime of an active frontend request into three sequential pipeline stages. A request is counted in exactly one stage at a time (via an RAII guard that increments on stage entry and decrements on stage exit), and is counted in `dynamo_frontend_active_requests` for its entire lifetime. Between stages — and after `dispatch` exits while the backend is streaming tokens — the request is still in `active_requests` but in no `stage_requests` bucket.

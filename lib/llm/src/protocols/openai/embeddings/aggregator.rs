@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::NvCreateEmbeddingResponse;
+use super::{NvCreateEmbeddingResponse, expand_embedding_response_shm};
 use crate::protocols::{
     Annotated,
     codec::{Message, SseCodecError},
@@ -18,6 +18,13 @@ impl StreamAggregable for NvCreateEmbeddingResponse {
     }
 
     fn merge(&mut self, next: Self) {
+        if let Err(err) = expand_embedding_response_shm(self) {
+            tracing::error!(error = %err, "failed to expand existing embedding SHM response during aggregation");
+        }
+        let mut next = next;
+        if let Err(err) = expand_embedding_response_shm(&mut next) {
+            tracing::error!(error = %err, "failed to expand embedding SHM response during aggregation");
+        }
         self.inner.data.extend(next.inner.data);
         self.inner.usage.prompt_tokens += next.inner.usage.prompt_tokens;
         self.inner.usage.total_tokens += next.inner.usage.total_tokens;
@@ -37,7 +44,9 @@ impl NvCreateEmbeddingResponse {
     pub async fn from_annotated_stream(
         stream: impl Stream<Item = Annotated<NvCreateEmbeddingResponse>>,
     ) -> Result<NvCreateEmbeddingResponse, String> {
-        aggregate_stream(stream).await
+        let mut response = aggregate_stream(stream).await?;
+        expand_embedding_response_shm(&mut response)?;
+        Ok(response)
     }
 }
 
@@ -61,6 +70,7 @@ mod tests {
                     total_tokens,
                 },
             },
+            embedding_response_shm: None,
         };
 
         Annotated::from_data(response)

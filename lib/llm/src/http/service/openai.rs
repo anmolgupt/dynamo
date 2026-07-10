@@ -52,7 +52,9 @@ use crate::protocols::openai::{
         NvCreateChatCompletionStreamResponse,
     },
     completions::{NvCreateCompletionRequest, NvCreateCompletionResponse},
-    embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
+    embeddings::{
+        NvCreateEmbeddingRequest, NvCreateEmbeddingResponse, maybe_write_embedding_request_shm,
+    },
     images::{NvCreateImageRequest, NvImagesResponse},
     responses::{NvCreateResponse, NvResponse, ResponseParams, chat_completion_to_response},
     videos::{NvCreateVideoRequest, NvVideosResponse},
@@ -849,12 +851,15 @@ async fn completions_batch(
 async fn embeddings(
     State(state): State<Arc<service_v2::State>>,
     headers: HeaderMap,
-    Json(request): Json<NvCreateEmbeddingRequest>,
+    Json(mut request): Json<NvCreateEmbeddingRequest>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
     let request_id = get_or_create_request_id(&headers);
+    if let Err(err) = maybe_write_embedding_request_shm(&mut request, "text", &request_id) {
+        tracing::warn!(request_id = %request_id, error = %err, "embedding request SHM failed; using request-plane payload");
+    }
     let request = Context::with_id(request, request_id);
     let request_id = request.id().to_string();
 

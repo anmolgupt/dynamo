@@ -49,6 +49,32 @@ impl Encoder for FastTokenizer {
     fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
         inputs.par_iter().map(|input| self.encode(input)).collect()
     }
+
+    fn encode_with_special_tokens(
+        &self,
+        input: &str,
+        add_special_tokens: bool,
+    ) -> Result<Encoding> {
+        if add_special_tokens {
+            self.hf_decoder
+                .encode_with_special_tokens(input, add_special_tokens)
+        } else {
+            self.encode(input)
+        }
+    }
+
+    fn encode_batch_with_special_tokens(
+        &self,
+        inputs: &[&str],
+        add_special_tokens: bool,
+    ) -> Result<Vec<Encoding>> {
+        if add_special_tokens {
+            self.hf_decoder
+                .encode_batch_with_special_tokens(inputs, add_special_tokens)
+        } else {
+            self.encode_batch(inputs)
+        }
+    }
 }
 
 impl Decoder for FastTokenizer {

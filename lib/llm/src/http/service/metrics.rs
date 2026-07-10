@@ -25,6 +25,7 @@ use std::{
 
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 use crate::model_card::ModelDeploymentCard;
+use crate::protocols::openai::embeddings::register_embedding_shm_metrics;
 use dynamo_runtime::metrics::prometheus_names::clamp_u64_to_i64;
 
 use dynamo_runtime::error::ErrorType as DynamoErrorType;
@@ -950,6 +951,7 @@ impl Metrics {
         ))?;
         registry.register(Box::new(self.model_cancellation_total.clone()))?;
         registry.register(Box::new(self.model_rejection_total.clone()))?;
+        register_embedding_shm_metrics(registry)?;
 
         Ok(())
     }
